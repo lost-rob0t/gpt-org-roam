@@ -8,7 +8,7 @@
 - [[id:1111004a-95fd-488b-979b-e8433431e299][StarLang]]
 
 * Tutorials
-- [[id:41d65192-9402-4597-940d-3fb304e6ebc9][StarLang from Zero: Compiler, Contracts, Documents, and Durable Actors]]
+- [[id:41d65192-9402-4597-940d-3fb304e6ebc9][StarLang from Zero to Advanced: Contracts, Actors, Service URIs, and Durable Runtime]]
 
 * Architecture
 - [[id:dca7bf46-7062-4e34-bfaf-8bec6e520a42][StarLang Compiler and Runtime Architecture]]
