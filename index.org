@@ -6,9 +6,11 @@
 
 * Projects
 - [[id:1111004a-95fd-488b-979b-e8433431e299][StarLang]]
+- [[id:e28942c8-14c7-48dc-82d0-e63a0f08c168][StarIntel Server]]
 
 * Tutorials
 - [[id:41d65192-9402-4597-940d-3fb304e6ebc9][StarLang from Zero to Advanced: Contracts, Actors, Service URIs, and Durable Runtime]]
+- [[id:d4453dbf-e72e-4876-998d-9549937fe71b][StarIntel Scrapers and Spiders from Zero: Project A Server, Project B RabbitMQ Crawler]]
 
 * Architecture
 - [[id:dca7bf46-7062-4e34-bfaf-8bec6e520a42][StarLang Compiler and Runtime Architecture]]

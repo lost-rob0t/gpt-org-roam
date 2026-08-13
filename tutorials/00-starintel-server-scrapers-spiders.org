@@ -1,0 +1,4446 @@
+:PROPERTIES:
+:ID:       d4453dbf-e72e-4876-998d-9549937fe71b
+:END:
+#+title: StarIntel Scrapers and Spiders from Zero: Project A Server, Project B RabbitMQ Crawler
+#+filetags: :starintel:tutorial:scraping:spiders:scrapy:rabbitmq:couchdb:python:nix:
+#+property: repo https://github.com/lost-rob0t/starintel-server
+#+property: source_ref master
+#+property: verified_against e2fa1991d8b08b74bcb2194c7a10f02da2431ad1
+#+property: verified_on 2026-08-13
+#+options: toc:4
+
+* Goal
+
+This tutorial teaches web scraping and crawling by building a complete StarIntel
+ingest path instead of an isolated toy script.
+
+You will build two projects:
+
+#+begin_example
+Project A: StarIntel Server
+  CouchDB + Clouseau + RabbitMQ + star-server
+
+Project B: StarIntel Web Spider
+  HTTP fetch -> HTML parse -> normalize -> RabbitMQ -> StarIntel -> CouchDB
+#+end_example
+
+By the end you should be able to:
+
+- explain the difference between a scraper, crawler, and spider;
+- start the real =lost-rob0t/starintel-server= stack in a few commands;
+- identify the real RabbitMQ exchange, queues, and topic routing keys;
+- publish a StarIntel document directly to RabbitMQ;
+- watch StarIntel persist it and emit a post-insert event;
+- write a one-page scraper before adding crawling;
+- build a Scrapy spider that follows links safely;
+- normalize pages into deterministic StarIntel =url= documents;
+- make duplicate delivery safe with deterministic identity;
+- attach provenance and crawl metadata;
+- emit relations between discovered pages;
+- use Rabbit publisher confirms and persistent messages;
+- understand ACK/NACK and at-least-once delivery;
+- test the spider without touching the public Internet;
+- observe the resulting documents in CouchDB and through StarIntel search;
+- turn the spider into a RabbitMQ external actor that consumes StarIntel targets;
+- reason about retries, backpressure, dead letters, recurrence, and crawl loops;
+- migrate the producer toward strict StarIntel 0.9 documents without pretending
+  the current Rabbit ingest path validates them.
+
+The canonical project node for the server is
+[[id:e28942c8-14c7-48dc-82d0-e63a0f08c168][StarIntel Server]].
+
+* 1. Current-state warning
+
+This tutorial is verified against =starintel-server= master commit:
+
+#+begin_example
+e2fa1991d8b08b74bcb2194c7a10f02da2431ad1
+#+end_example
+
+The project is actively evolving. In particular, the current server sits between
+two document generations:
+
+- strict StarIntel 0.9.0 schema-driven documents;
+- legacy flat 0.8-style documents still used by parts of the Common Lisp server.
+
+The important current behavior for this tutorial is:
+
+1. RabbitMQ ingest accepts JSON with a non-empty =dtype=.
+2. The Rabbit ingest handler does not currently run the strict StarIntel 0.9
+   validator.
+3. New external producers should not use that looseness as an excuse to invent
+   random fields.
+4. This tutorial uses a small flat =url= bridge document because its exact
+   current-server fields are documented and easy to inspect.
+5. A later section shows the migration boundary toward strict 0.9.
+
+Do not read this tutorial as a claim that flat 0.8 is the final StarIntel format.
+
+* 2. The architecture you are about to build
+
+The final data path is:
+
+#+begin_example
+                 PROJECT B
+          +----------------------+
+          |   Scrapy spider      |
+          |                      |
+seed ---> | GET page             |
+          | parse HTML           |
+          | follow links         |
+          | normalize document   |
+          +----------+-----------+
+                     |
+                     | AMQP publish
+                     | exchange: documents
+                     | key: documents.ingest.url
+                     v
+              +-------------+
+              |  RabbitMQ   |
+              +------+------+ 
+                     |
+                     | documents.ingest.#
+                     v
+                 PROJECT A
+          +----------------------+
+          |   starintel-server   |
+          |                      |
+          | ingest consumer      |
+          | normalize _id        |
+          | write CouchDB        |
+          | attach _rev          |
+          +----------+-----------+
+                     |
+                     +----> CouchDB / Clouseau
+                     |
+                     | publish documents.new.url
+                     v
+          downstream actors / observers
+#+end_example
+
+The distinction between =documents.ingest.url= and =documents.new.url= matters.
+
+=documents.ingest.url= means:
+
+#+begin_quote
+Please persist this new =url= document.
+#+end_quote
+
+=documents.new.url= means:
+
+#+begin_quote
+This =url= document is already durable and has been emitted as a post-insert
+event.
+#+end_quote
+
+Publishing a brand-new finding directly to =documents.new.url= bypasses normal
+ingest persistence.
+
+* 3. What is a scraper?
+
+A scraper extracts structured values from one fetched representation.
+
+Given:
+
+#+begin_src html
+<article>
+  <h1>Example title</h1>
+  <p class="body">Example body.</p>
+</article>
+#+end_src
+
+a scraper might produce:
+
+#+begin_src json
+{
+  "title": "Example title",
+  "body": "Example body."
+}
+#+end_src
+
+The important verbs are:
+
+#+begin_example
+fetch -> parse -> select -> normalize
+#+end_example
+
+A scraper does not have to discover additional URLs.
+
+* 4. What is a crawler?
+
+A crawler discovers additional resources and schedules them.
+
+Given:
+
+#+begin_src html
+<a href="/article-a.html">A</a>
+<a href="/article-b.html">B</a>
+#+end_src
+
+a crawler adds those links to a frontier and fetches them later.
+
+The important verbs become:
+
+#+begin_example
+fetch
+  -> parse
+  -> extract data
+  -> discover links
+  -> normalize links
+  -> deduplicate links
+  -> schedule more requests
+#+end_example
+
+* 5. What is a spider?
+
+In frameworks such as Scrapy, "spider" normally means the component that owns
+crawl behavior:
+
+- seed URLs;
+- which responses to parse;
+- which links to follow;
+- which items to emit;
+- spider-specific limits and policy.
+
+A useful mental model is:
+
+#+begin_example
+scraper = page -> data
+crawler = pages -> more pages
+spider  = crawler policy + parsing callbacks
+#+end_example
+
+A real spider contains scraper logic, but a scraper does not necessarily crawl.
+
+* 6. The crawl frontier
+
+A crawl frontier is the set of work that has been discovered but not yet fully
+processed.
+
+Conceptually:
+
+#+begin_example
+seen = {canonical URLs already scheduled}
+
+frontier = [
+  URL waiting for fetch,
+  URL waiting for fetch,
+  ...
+]
+#+end_example
+
+A production crawler also tracks:
+
+- priority;
+- retry count;
+- domain;
+- next eligible request time;
+- source page;
+- crawl depth;
+- content type;
+- last fetch time;
+- robots policy;
+- tenant/dataset;
+- trace identity.
+
+Scrapy already gives you a scheduler, request deduplication, downloader,
+middleware, retry machinery, and concurrency controls. That is why Project B
+will graduate from a tiny hand-written scraper into Scrapy instead of
+reimplementing a crawler runtime accidentally.
+
+* 7. Scraping is not permission to hammer a site
+
+This tutorial uses a local fixture site first.
+
+When adapting the spider to a real site:
+
+- obey applicable law and authorization;
+- respect =robots.txt= unless you have a legitimate reason and authorization not
+  to;
+- identify your user agent where appropriate;
+- use finite concurrency;
+- use delays;
+- honor explicit rate limits;
+- do not bypass authentication or access controls;
+- do not add CAPTCHA bypass or anti-bot evasion to a general crawler;
+- minimize collection of sensitive personal data;
+- retain provenance so a collected fact can be audited;
+- prefer official APIs when they are the more stable and authorized interface.
+
+A fast crawler that gets your IP blocked is not a good crawler.
+
+* PART I — PROJECT A: START STARINTEL SERVER
+
+* 8. Project A in one sentence
+
+Project A is the real StarIntel backend:
+
+#+begin_example
+RabbitMQ
+  + CouchDB
+  + Clouseau
+  + star-server
+#+end_example
+
+The Compose file binds service ports to loopback by default, which is exactly
+what we want for this tutorial.
+
+* 9. Prerequisites for Project A
+
+You need:
+
+- Git;
+- Nix with flakes;
+- Docker;
+- Docker Compose v2;
+- =curl=;
+- =jq=;
+- =openssl=.
+
+Check:
+
+#+begin_src sh
+git --version
+nix --version
+docker --version
+docker compose version
+curl --version
+jq --version
+openssl version
+#+end_src
+
+The server repository's own full-stack test uses Nix to build/load the images
+and Docker Compose to start the real stack.
+
+* 10. Clone Project A
+
+#+begin_src sh
+mkdir -p ~/Projects
+cd ~/Projects
+git clone https://github.com/lost-rob0t/starintel-server.git
+cd starintel-server
+#+end_src
+
+Verify the revision if you want to reproduce this tutorial exactly:
+
+#+begin_src sh
+git rev-parse HEAD
+#+end_src
+
+The tutorial was checked against:
+
+#+begin_example
+e2fa1991d8b08b74bcb2194c7a10f02da2431ad1
+#+end_example
+
+Do not hard-reset a newer checkout merely to match this document. Inspect the
+diff first.
+
+* 11. Project A: create local secrets
+
+The current Compose stack expects files under =./secrets= unless
+=CREDENTIALS_DIR= points elsewhere.
+
+Use a restrictive umask:
+
+#+begin_src sh
+cd ~/Projects/starintel-server
+umask 077
+mkdir -p secrets
+
+openssl rand -hex 32 > secrets/couchdb_password
+openssl rand -hex 32 > secrets/couchdb_secret
+openssl rand -hex 24 > secrets/erlang_cookie
+openssl rand -hex 32 > secrets/rabbitmq_password
+openssl rand -hex 48 > secrets/auth_pepper
+openssl rand -hex 32 > secrets/auth_bootstrap_secret
+
+chmod 0600 secrets/*
+#+end_src
+
+The six files correspond to the current Compose secrets:
+
+#+begin_example
+couchdb_password
+couchdb_secret
+erlang_cookie
+rabbitmq_password
+auth_pepper
+auth_bootstrap_secret
+#+end_example
+
+Never commit these files.
+
+* 12. Project A: optional .env
+
+The Compose defaults are sufficient for localhost, but an explicit =.env= makes
+the tutorial easier to inspect:
+
+#+begin_src sh
+cat > .env <<'EOF'
+COUCHDB_USER=admin
+COUCHDB_BIND_ADDRESS=127.0.0.1
+COUCHDB_PORT=5984
+
+RABBITMQ_USER=starintel
+RABBITMQ_BIND_ADDRESS=127.0.0.1
+RABBITMQ_PORT=5672
+RABBITMQ_MANAGEMENT_PORT=15672
+
+STAR_SERVER_BIND_ADDRESS=127.0.0.1
+STAR_SERVER_PORT=5000
+
+CREDENTIALS_DIR=./secrets
+CLOUSEAU_JAVA_OPTS=-Xms256m -Xmx1g
+EOF
+#+end_src
+
+This file contains usernames and port choices, not the secret values.
+
+* 13. Project A: build/load the repository images
+
+The repository full-stack test uses:
+
+#+begin_src sh
+nix run .#load-images
+#+end_src
+
+This builds/loads the images expected by the current Compose stack, including
+the StarIntel-specific CouchDB/Clouseau/server images.
+
+If this fails, debug the Nix build before trying to repair Docker Compose.
+
+* 14. Project A: validate Compose
+
+#+begin_src sh
+docker compose config --quiet
+#+end_src
+
+A clean return means Compose can resolve the file, environment, and secret
+paths.
+
+It does not prove the services can start.
+
+* 15. Project A: start the whole stack
+
+#+begin_src sh
+docker compose up --detach --wait --wait-timeout 300
+#+end_src
+
+Inspect:
+
+#+begin_src sh
+docker compose ps
+#+end_src
+
+The four current services are:
+
+#+begin_example
+clouseau
+couchdb
+rabbitmq
+star-server
+#+end_example
+
+* 16. Project A: the short setup checklist
+
+If you already understand the preceding details, the short version is:
+
+#+begin_src sh
+git clone https://github.com/lost-rob0t/starintel-server.git
+cd starintel-server
+
+umask 077
+mkdir -p secrets
+openssl rand -hex 32 > secrets/couchdb_password
+openssl rand -hex 32 > secrets/couchdb_secret
+openssl rand -hex 24 > secrets/erlang_cookie
+openssl rand -hex 32 > secrets/rabbitmq_password
+openssl rand -hex 48 > secrets/auth_pepper
+openssl rand -hex 32 > secrets/auth_bootstrap_secret
+chmod 0600 secrets/*
+
+nix run .#load-images
+docker compose config --quiet
+docker compose up -d --wait --wait-timeout 300
+
+curl --fail http://127.0.0.1:5000/health
+#+end_src
+
+That is Project A's bootstrap path.
+
+* 17. Verify StarIntel health
+
+#+begin_src sh
+curl --fail --silent --show-error \
+  http://127.0.0.1:5000/health | jq .
+#+end_src
+
+If =/health= fails:
+
+#+begin_src sh
+docker compose ps
+docker compose logs --tail=200 star-server
+docker compose logs --tail=100 rabbitmq
+docker compose logs --tail=100 couchdb
+#+end_src
+
+Do not proceed to Project B while Project A is unhealthy.
+
+* 18. Verify RabbitMQ
+
+RabbitMQ's AMQP port is:
+
+#+begin_example
+127.0.0.1:5672
+#+end_example
+
+The management UI is:
+
+#+begin_example
+http://127.0.0.1:15672
+#+end_example
+
+The default Compose username is:
+
+#+begin_example
+starintel
+#+end_example
+
+The password is the contents of:
+
+#+begin_example
+secrets/rabbitmq_password
+#+end_example
+
+Print it only when needed in a private shell:
+
+#+begin_src sh
+RABBIT_PASSWORD="$(cat secrets/rabbitmq_password)"
+printf '%s\n' "$RABBIT_PASSWORD"
+#+end_src
+
+Avoid putting it in shell history as a literal command argument.
+
+* 19. Verify CouchDB
+
+The default CouchDB endpoint is:
+
+#+begin_example
+http://127.0.0.1:5984
+#+end_example
+
+Load credentials into variables:
+
+#+begin_src sh
+export COUCHDB_USER=admin
+export COUCHDB_PASSWORD="$(cat secrets/couchdb_password)"
+#+end_src
+
+Check:
+
+#+begin_src sh
+curl --fail --silent --show-error \
+  --user "$COUCHDB_USER:$COUCHDB_PASSWORD" \
+  http://127.0.0.1:5984/_up | jq .
+#+end_src
+
+The default StarIntel data database is =starintel=.
+
+* 20. First-run HTTP authentication
+
+The current server creates an initial human administrator on an empty auth
+database:
+
+#+begin_example
+username: star
+password: intel
+#+end_example
+
+That password exists for first-run convenience. Change it before exposing the
+server beyond a trusted local environment.
+
+Log in:
+
+#+begin_src sh
+LOGIN="$(
+  curl --fail --silent --show-error \
+    --request POST \
+    --header 'Content-Type: application/json' \
+    --data '{"username":"star","password":"intel"}' \
+    http://127.0.0.1:5000/auth/login
+)"
+
+printf '%s\n' "$LOGIN" | jq .
+export STAR_API_KEY="$(printf '%s\n' "$LOGIN" | jq -r '.api_key')"
+#+end_src
+
+The returned key uses the =star_sk_v1_= credential family.
+
+* 21. Rotate the first-run password
+
+Choose a new password without writing it into source control:
+
+#+begin_src sh
+read -rsp 'New StarIntel password: ' NEW_STAR_PASSWORD
+printf '\n'
+
+curl --fail --silent --show-error \
+  --request POST \
+  --header 'Content-Type: application/json' \
+  --header "Authorization: Bearer $STAR_API_KEY" \
+  --data "$(
+    jq -nc \
+      --arg current 'intel' \
+      --arg new "$NEW_STAR_PASSWORD" \
+      '{current_password:$current,new_password:$new}'
+  )" \
+  http://127.0.0.1:5000/auth/password | jq .
+#+end_src
+
+For a long-lived environment, also override the initial credential before first
+startup rather than relying on =star:intel=.
+
+* 22. Machine bootstrap credential
+
+The stack also supports the bootstrap secret from:
+
+#+begin_example
+secrets/auth_bootstrap_secret
+#+end_example
+
+The repository's own stack test proves this path:
+
+#+begin_src sh
+export STAR_BOOTSTRAP_SECRET="$(cat secrets/auth_bootstrap_secret)"
+
+BOOTSTRAP="$(
+  curl --fail --silent --show-error \
+    --request POST \
+    --header 'Content-Type: application/json' \
+    --header "X-Star-Bootstrap-Secret: $STAR_BOOTSTRAP_SECRET" \
+    --data '{"owner":"tutorial-administrator"}' \
+    http://127.0.0.1:5000/auth/bootstrap
+)"
+
+printf '%s\n' "$BOOTSTRAP" | jq .
+#+end_src
+
+Bootstrap is one-time. A second successful bootstrap is not the expected
+contract.
+
+Project B does not need an HTTP API key for RabbitMQ publishing. It needs a
+RabbitMQ credential.
+
+* 23. The exact RabbitMQ topology
+
+The current StarIntel messaging documentation defines a durable topic exchange:
+
+#+begin_example
+exchange: documents
+type:     topic
+#+end_example
+
+Important flows:
+
+| Flow | Queue | Topic |
+|------+-------+-------|
+| persist new document | =documents.ingest= | consumer binds =documents.ingest.#= |
+| emit new typed document | — | producer uses =documents.ingest.<dtype>= |
+| post-insert event | actor-specific | =documents.new.<dtype>= |
+| update ingest | =documents.updates.ingest= | =documents.updated.#= |
+| persisted target intake | =documents.targets= | =documents.new.target.#= |
+| remote actor target | actor-specific | =actors.<actor>.new.target= |
+
+For our page documents:
+
+#+begin_example
+documents.ingest.url
+#+end_example
+
+is the producer key.
+
+* 24. What StarIntel does after our publish
+
+When Project B publishes a JSON body to:
+
+#+begin_example
+documents / documents.ingest.url
+#+end_example
+
+the current server:
+
+1. parses the JSON;
+2. requires a non-empty =dtype=;
+3. generates =_id= if absent;
+4. writes the document to CouchDB;
+5. adds the returned =_id= and =_rev=;
+6. publishes the enriched document to =documents.new.url=;
+7. ACKs the ingest delivery after the required work succeeds.
+
+That last ordering is why downstream actors should consume
+=documents.new.url= when they require a persisted document.
+
+* 25. Delivery is at least once
+
+StarIntel explicitly documents at-least-once processing.
+
+A failure can happen after an external side effect and before an ACK.
+
+Therefore:
+
+#+begin_example
+delivery once       -> possible
+delivery twice      -> possible
+delivery many times -> possible
+exactly once        -> NOT guaranteed
+#+end_example
+
+Our spider must be idempotent.
+
+We will accomplish that by giving deterministic page snapshots deterministic
+IDs.
+
+* 26. Why deterministic IDs are useful for spiders
+
+Suppose a page is fetched twice and produces identical normalized content.
+
+If both attempts use random IDs:
+
+#+begin_example
+crawl 1 -> url-A
+crawl 2 -> url-B
+#+end_example
+
+you created a duplicate.
+
+If both use a stable digest:
+
+#+begin_example
+id = SHA256(canonical URL + normalized content)
+#+end_example
+
+then:
+
+#+begin_example
+crawl 1 -> url-8c...
+crawl 2 -> url-8c...
+#+end_example
+
+CouchDB's conflict becomes a natural duplicate signal.
+
+If page content changes, the content hash changes and the tutorial producer
+creates a new snapshot.
+
+That is a useful immutable-snapshot model for scraping.
+
+* 27. Current StarIntel document generations
+
+The current server documentation distinguishes:
+
+**Strict 0.9**
+
+Conceptually:
+
+#+begin_src json
+{
+  "schema_version": "0.9.0",
+  "dtype": "person",
+  "_id": "01J...",
+  "dataset": "investigation-a",
+  "sources": ["manual"],
+  "data": {},
+  "extensions": {}
+}
+#+end_src
+
+**Legacy flat 0.8-style server documents**
+
+Common fields include:
+
+#+begin_example
+_id
+_rev
+dataset
+dtype
+sources
+version
+dateAdded
+dateUpdated
+#+end_example
+
+The legacy =url= type adds:
+
+#+begin_example
+url
+path
+query
+content
+#+end_example
+
+Project B uses that exact flat =url= bridge for the hands-on current-server
+exercise.
+
+* 28. Our Project B document contract
+
+A page will become:
+
+#+begin_src json
+{
+  "_id": "url-<sha256>",
+  "dataset": "tutorial-web",
+  "dtype": "url",
+  "sources": [
+    "web-spider",
+    "http://127.0.0.1:8008/article-a.html"
+  ],
+  "version": "0.8.0",
+  "dateAdded": 1786590000,
+  "dateUpdated": 1786590000,
+  "url": "http://127.0.0.1:8008/article-a.html",
+  "path": "/article-a.html",
+  "query": "",
+  "content": "Article A Example body.",
+  "extensions": {
+    "scraper": {
+      "content_sha256": "sha256:...",
+      "http_status": 200,
+      "spider": "tutorial_site"
+    }
+  }
+}
+#+end_src
+
+This is a tutorial producer contract for the current server.
+
+It is not presented as a strict 0.9 schema object.
+
+* PART II — PROJECT B: BUILD A SCRAPER FIRST
+
+* 29. Create Project B
+
+In another directory:
+
+#+begin_src sh
+cd ~/Projects
+mkdir -p starintel-web-spider
+cd starintel-web-spider
+git init
+#+end_src
+
+Project B is independent of the StarIntel server source tree.
+
+Its only runtime integration boundary is RabbitMQ.
+
+* 30. Project B layout
+
+We will end with:
+
+#+begin_example
+starintel-web-spider/
+├── flake.nix
+├── pyproject.toml
+├── fixtures/
+│   └── site/
+│       ├── index.html
+│       ├── article-a.html
+│       └── article-b.html
+├── star_spider/
+│   ├── __init__.py
+│   ├── items.py
+│   ├── pipelines.py
+│   ├── settings.py
+│   ├── starintel.py
+│   └── spiders/
+│       ├── __init__.py
+│       └── tutorial_site.py
+├── scrapy.cfg
+├── scripts/
+│   ├── publish_smoke.py
+│   └── observe_new_urls.py
+└── tests/
+    ├── test_starintel.py
+    └── test_spider.py
+#+end_example
+
+* 31. Project B Nix development shell
+
+Create =flake.nix=:
+
+#+begin_src nix
+{
+  description = "StarIntel scraper/spider tutorial";
+
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
+  outputs = { self, nixpkgs }:
+    let
+      system = "x86_64-linux";
+      pkgs = import nixpkgs { inherit system; };
+    in {
+      devShells.${system}.default = pkgs.mkShell {
+        packages = with pkgs; [
+          python312
+          uv
+          curl
+          jq
+        ];
+
+        shellHook = ''
+          echo "StarIntel spider dev shell"
+        '';
+      };
+    };
+}
+#+end_src
+
+Enter it:
+
+#+begin_src sh
+nix develop
+#+end_src
+
+If you are on a different architecture, change =system= accordingly or make the
+flake multi-system later.
+
+* 32. Python project metadata
+
+Create =pyproject.toml=:
+
+#+begin_src toml
+[project]
+name = "starintel-web-spider"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "beautifulsoup4",
+  "pika",
+  "requests",
+  "scrapy"
+]
+
+[dependency-groups]
+dev = [
+  "pytest"
+]
+#+end_src
+
+Install into a local environment:
+
+#+begin_src sh
+uv sync
+#+end_src
+
+Run commands through:
+
+#+begin_example
+uv run ...
+#+end_example
+
+* 33. Build a deterministic local website
+
+Create the fixture directory:
+
+#+begin_src sh
+mkdir -p fixtures/site
+#+end_src
+
+=fixtures/site/index.html=:
+
+#+begin_src html
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Tutorial Index</title>
+  </head>
+  <body>
+    <main>
+      <h1>Tutorial Index</h1>
+      <p>This is our deterministic crawl seed.</p>
+      <ul>
+        <li><a href="/article-a.html">Article A</a></li>
+        <li><a href="/article-b.html">Article B</a></li>
+      </ul>
+    </main>
+  </body>
+</html>
+#+end_src
+
+=fixtures/site/article-a.html=:
+
+#+begin_src html
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Article A</title>
+  </head>
+  <body>
+    <article>
+      <h1>Article A</h1>
+      <p class="body">RabbitMQ connects the spider to StarIntel.</p>
+      <a href="/article-b.html">Next article</a>
+    </article>
+  </body>
+</html>
+#+end_src
+
+=fixtures/site/article-b.html=:
+
+#+begin_src html
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Article B</title>
+  </head>
+  <body>
+    <article>
+      <h1>Article B</h1>
+      <p class="body">CouchDB stores the durable result.</p>
+      <a href="/index.html">Back to index</a>
+    </article>
+  </body>
+</html>
+#+end_src
+
+This tiny site deliberately contains a cycle:
+
+#+begin_example
+index -> A -> B -> index
+#+end_example
+
+Your crawler must not loop forever.
+
+* 34. Start the fixture site
+
+In one terminal:
+
+#+begin_src sh
+cd ~/Projects/starintel-web-spider
+
+uv run python -m http.server \
+  8008 \
+  --bind 127.0.0.1 \
+  --directory fixtures/site
+#+end_src
+
+Verify:
+
+#+begin_src sh
+curl --fail http://127.0.0.1:8008/index.html
+#+end_src
+
+Now every crawling exercise is deterministic and local.
+
+* 35. Your first one-page scraper
+
+Before Scrapy, write the smallest possible scraper.
+
+Create =scratch_scraper.py=:
+
+#+begin_src python
+from bs4 import BeautifulSoup
+import requests
+
+url = "http://127.0.0.1:8008/article-a.html"
+
+response = requests.get(
+    url,
+    timeout=10,
+    headers={"User-Agent": "starintel-tutorial-spider/0.1"},
+)
+response.raise_for_status()
+
+soup = BeautifulSoup(response.text, "html.parser")
+
+title = soup.select_one("h1")
+body = soup.select_one("p.body")
+
+print(
+    {
+        "url": response.url,
+        "title": title.get_text(" ", strip=True) if title else "",
+        "body": body.get_text(" ", strip=True) if body else "",
+    }
+)
+#+end_src
+
+Run:
+
+#+begin_src sh
+uv run python scratch_scraper.py
+#+end_src
+
+Expected shape:
+
+#+begin_example
+{
+  'url': 'http://127.0.0.1:8008/article-a.html',
+  'title': 'Article A',
+  'body': 'RabbitMQ connects the spider to StarIntel.'
+}
+#+end_example
+
+That is scraping.
+
+It fetched exactly one page and extracted fields.
+
+* 36. What the tiny scraper is missing
+
+It does not yet handle:
+
+- link discovery;
+- URL canonicalization;
+- frontier deduplication;
+- retries;
+- robots policy;
+- per-host concurrency;
+- download delays;
+- item pipelines;
+- structured provenance;
+- RabbitMQ publishing;
+- backpressure;
+- graceful shutdown;
+- crawl stats.
+
+Do not keep adding all of those to one hand-written loop.
+
+That is the point where a crawler framework becomes useful.
+
+* PART III — NORMALIZE DATA BEFORE TRANSPORT
+
+* 37. Separate scraping from StarIntel normalization
+
+A clean pipeline has independent steps:
+
+#+begin_example
+HTML
+  -> scraped page fields
+  -> normalized StarIntel document
+  -> serialized JSON
+  -> RabbitMQ publish
+#+end_example
+
+Do not put all normalization logic inside the spider's CSS selectors.
+
+That would make it harder to unit-test and harder to reuse with another spider.
+
+* 38. Create star_spider/starintel.py
+
+#+begin_src sh
+mkdir -p star_spider/spiders tests scripts
+touch star_spider/__init__.py
+touch star_spider/spiders/__init__.py
+#+end_src
+
+Create =star_spider/starintel.py=:
+
+#+begin_src python
+from __future__ import annotations
+
+import hashlib
+import re
+import time
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+
+_WHITESPACE = re.compile(r"\s+")
+
+
+def normalize_text(value: str) -> str:
+    return _WHITESPACE.sub(" ", value).strip()
+
+
+def canonical_url(value: str) -> str:
+    parts = urlsplit(value)
+
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+
+    if not scheme or not host:
+        raise ValueError(f"absolute URL required: {value!r}")
+
+    port = parts.port
+    if port is None:
+        netloc = host
+    elif (scheme == "http" and port == 80) or (
+        scheme == "https" and port == 443
+    ):
+        netloc = host
+    else:
+        netloc = f"{host}:{port}"
+
+    path = parts.path or "/"
+
+    # Stable order for ordinary query pairs.
+    query = urlencode(sorted(parse_qsl(parts.query, keep_blank_values=True)))
+
+    # Fragments are client-side location identifiers and are intentionally
+    # omitted from the crawl identity here.
+    return urlunsplit((scheme, netloc, path, query, ""))
+
+
+def content_sha256(content: str) -> str:
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def snapshot_id(url: str, content: str) -> str:
+    canonical = canonical_url(url)
+    normalized = normalize_text(content)
+
+    payload = (
+        "starintel-url-snapshot-v1"
+        + "\0"
+        + canonical
+        + "\0"
+        + normalized
+    ).encode("utf-8")
+
+    return "url-" + hashlib.sha256(payload).hexdigest()
+
+
+def make_url_document(
+    *,
+    url: str,
+    title: str,
+    text: str,
+    dataset: str,
+    spider: str,
+    http_status: int,
+    source_url: str | None = None,
+    parent_id: str | None = None,
+) -> dict:
+    canonical = canonical_url(url)
+    split = urlsplit(canonical)
+    content = normalize_text(" ".join(part for part in [title, text] if part))
+    now = int(time.time())
+
+    document = {
+        "_id": snapshot_id(canonical, content),
+        "dataset": dataset,
+        "dtype": "url",
+        "sources": [spider, source_url or canonical],
+        "version": "0.8.0",
+        "dateAdded": now,
+        "dateUpdated": now,
+        "url": canonical,
+        "path": split.path,
+        "query": split.query,
+        "content": content,
+        "extensions": {
+            "scraper": {
+                "spider": spider,
+                "http_status": http_status,
+                "content_sha256": content_sha256(content),
+            }
+        },
+    }
+
+    if parent_id:
+        document["extensions"]["star_server"] = {
+            "parent_id": parent_id,
+        }
+
+    return document
+#+end_src
+
+* 39. Why canonicalize URLs?
+
+These can refer to the same logical resource:
+
+#+begin_example
+HTTP://EXAMPLE.COM:80/a#section
+http://example.com/a
+#+end_example
+
+Without canonicalization, a crawler may schedule and store equivalent URLs as
+different resources.
+
+Our tutorial canonicalizer:
+
+- lowercases scheme;
+- lowercases host;
+- removes default ports;
+- ensures a path exists;
+- sorts ordinary query pairs;
+- drops fragments.
+
+This is intentionally conservative.
+
+Do not blindly sort query parameters for every production site. Some
+applications treat parameter order as meaningful.
+
+* 40. Why normalize text?
+
+HTML-derived text often contains:
+
+- line breaks;
+- tabs;
+- repeated spaces;
+- layout whitespace.
+
+If a deterministic ID hashes unnormalized text, harmless formatting changes can
+create new snapshots.
+
+We normalize runs of whitespace to one space before hashing.
+
+For evidence-grade archival crawling, keep the raw response separately too.
+Normalized text is a projection, not a replacement for raw evidence.
+
+* 41. Why hash content and URL?
+
+If identity used only the URL:
+
+#+begin_example
+same URL + new content -> same ID
+#+end_example
+
+Then a new crawl would need the update path.
+
+For this tutorial we prefer immutable page snapshots:
+
+#+begin_example
+same URL + same content -> same ID
+same URL + new content  -> new ID
+#+end_example
+
+This also makes duplicate Rabbit delivery naturally idempotent.
+
+A production system may choose a stable resource ID plus versioned snapshot
+documents instead. The important thing is to define the model deliberately.
+
+* 42. Unit-test normalization
+
+Create =tests/test_starintel.py=:
+
+#+begin_src python
+from star_spider.starintel import (
+    canonical_url,
+    make_url_document,
+    normalize_text,
+    snapshot_id,
+)
+
+
+def test_normalize_text():
+    assert normalize_text("a\n  b\tc") == "a b c"
+
+
+def test_canonical_url():
+    assert (
+        canonical_url("HTTP://Example.COM:80/a?b=2&a=1#frag")
+        == "http://example.com/a?a=1&b=2"
+    )
+
+
+def test_snapshot_id_is_deterministic():
+    a = snapshot_id("http://example.com/a", "hello   world")
+    b = snapshot_id("http://EXAMPLE.com:80/a#x", "hello world")
+    assert a == b
+
+
+def test_content_change_changes_snapshot_id():
+    a = snapshot_id("http://example.com/a", "version one")
+    b = snapshot_id("http://example.com/a", "version two")
+    assert a != b
+
+
+def test_url_document_shape():
+    doc = make_url_document(
+        url="http://example.com/a",
+        title="Example",
+        text="Body",
+        dataset="tutorial-web",
+        spider="tutorial_site",
+        http_status=200,
+    )
+
+    assert doc["dtype"] == "url"
+    assert doc["dataset"] == "tutorial-web"
+    assert doc["_id"].startswith("url-")
+    assert doc["url"] == "http://example.com/a"
+    assert doc["content"] == "Example Body"
+    assert doc["extensions"]["scraper"]["http_status"] == 200
+#+end_src
+
+Run:
+
+#+begin_src sh
+uv run pytest -q
+#+end_src
+
+Do this before RabbitMQ enters the picture.
+
+* PART IV — PUBLISH ONE DOCUMENT TO RABBITMQ MANUALLY
+
+* 43. Load Project A Rabbit credentials
+
+In Project B's shell:
+
+#+begin_src sh
+export STAR_RABBIT_HOST=127.0.0.1
+export STAR_RABBIT_PORT=5672
+export STAR_RABBIT_USER=starintel
+export STAR_RABBIT_PASSWORD="$(
+  cat ~/Projects/starintel-server/secrets/rabbitmq_password
+)"
+#+end_src
+
+Do not put the password in =pyproject.toml= or source code.
+
+* 44. Create a RabbitMQ smoke publisher
+
+Create =scripts/publish_smoke.py=:
+
+#+begin_src python
+from __future__ import annotations
+
+import json
+import os
+
+import pika
+
+from star_spider.starintel import make_url_document
+
+
+def connect() -> pika.BlockingConnection:
+    credentials = pika.PlainCredentials(
+        os.environ["STAR_RABBIT_USER"],
+        os.environ["STAR_RABBIT_PASSWORD"],
+    )
+
+    return pika.BlockingConnection(
+        pika.ConnectionParameters(
+            host=os.environ.get("STAR_RABBIT_HOST", "127.0.0.1"),
+            port=int(os.environ.get("STAR_RABBIT_PORT", "5672")),
+            virtual_host="/",
+            credentials=credentials,
+            heartbeat=30,
+            blocked_connection_timeout=30,
+        )
+    )
+
+
+document = make_url_document(
+    url="http://127.0.0.1:8008/manual.html",
+    title="Manual Rabbit Test",
+    text="Published directly by Project B.",
+    dataset="tutorial-web",
+    spider="manual-rabbit-smoke",
+    http_status=200,
+)
+
+connection = connect()
+
+try:
+    channel = connection.channel()
+
+    channel.exchange_declare(
+        exchange="documents",
+        exchange_type="topic",
+        durable=True,
+    )
+
+    channel.confirm_delivery()
+
+    dtype = document["dtype"]
+    routing_key = f"documents.ingest.{dtype}"
+
+    channel.basic_publish(
+        exchange="documents",
+        routing_key=routing_key,
+        body=json.dumps(document).encode("utf-8"),
+        mandatory=True,
+        properties=pika.BasicProperties(
+            content_type="application/json",
+            content_encoding="utf-8",
+            delivery_mode=2,
+            type=dtype,
+            app_id="starintel-web-spider",
+        ),
+    )
+
+    print(document["_id"])
+finally:
+    connection.close()
+#+end_src
+
+* 45. Why declare the exchange?
+
+Project A creates/uses:
+
+#+begin_example
+documents / topic / durable
+#+end_example
+
+Project B declares the same topology defensively.
+
+RabbitMQ will reject incompatible redeclarations instead of silently turning a
+topic exchange into a different kind of exchange.
+
+* 46. Why publisher confirms?
+
+A normal =basic_publish= call can tell you that your process handed bytes to a
+client library. Publisher confirms let the broker acknowledge the publish.
+
+That still does not mean:
+
+#+begin_quote
+The document is safely stored in CouchDB.
+#+end_quote
+
+It means the Rabbit publish reached the broker under the confirm contract.
+
+The later =documents.new.url= event is the better signal that StarIntel finished
+the insert path.
+
+* 47. Why delivery_mode=2?
+
+AMQP delivery mode =2= marks the message persistent.
+
+For durable queueing you need the topology and message behavior to agree:
+
+#+begin_example
+durable exchange
++ durable queue
++ persistent message
++ RabbitMQ persistence behavior
+#+end_example
+
+Even then, durability is a broker guarantee, not an exactly-once application
+guarantee.
+
+* 48. Publish the smoke document
+
+With Project A healthy:
+
+#+begin_src sh
+cd ~/Projects/starintel-web-spider
+
+uv run python scripts/publish_smoke.py
+#+end_src
+
+You should see a deterministic document ID.
+
+Run it again.
+
+You should get the same ID because the normalized URL/content are the same.
+
+* 49. Verify the document in CouchDB
+
+Load Project A CouchDB credentials:
+
+#+begin_src sh
+export STAR_COUCH_USER=admin
+export STAR_COUCH_PASSWORD="$(
+  cat ~/Projects/starintel-server/secrets/couchdb_password
+)"
+#+end_src
+
+List =url= documents:
+
+#+begin_src sh
+curl --fail --silent --show-error \
+  --user "$STAR_COUCH_USER:$STAR_COUCH_PASSWORD" \
+  'http://127.0.0.1:5984/starintel/_all_docs?include_docs=true' |
+jq '
+  .rows[]
+  | .doc
+  | select(.dtype == "url")
+  | {
+      _id,
+      _rev,
+      dataset,
+      dtype,
+      url,
+      content
+    }
+'
+#+end_src
+
+The critical proof is that =_rev= exists.
+
+Project B did not generate that CouchDB revision.
+
+Project A did.
+
+* 50. Observe post-insert URL events
+
+Create =scripts/observe_new_urls.py=:
+
+#+begin_src python
+from __future__ import annotations
+
+import json
+import os
+
+import pika
+
+
+credentials = pika.PlainCredentials(
+    os.environ["STAR_RABBIT_USER"],
+    os.environ["STAR_RABBIT_PASSWORD"],
+)
+
+connection = pika.BlockingConnection(
+    pika.ConnectionParameters(
+        host=os.environ.get("STAR_RABBIT_HOST", "127.0.0.1"),
+        port=int(os.environ.get("STAR_RABBIT_PORT", "5672")),
+        credentials=credentials,
+        heartbeat=30,
+    )
+)
+
+channel = connection.channel()
+
+channel.exchange_declare(
+    exchange="documents",
+    exchange_type="topic",
+    durable=True,
+)
+
+result = channel.queue_declare(
+    queue="",
+    exclusive=True,
+    auto_delete=True,
+)
+
+queue_name = result.method.queue
+
+channel.queue_bind(
+    exchange="documents",
+    queue=queue_name,
+    routing_key="documents.new.url",
+)
+
+print("waiting for documents.new.url")
+
+
+def on_message(ch, method, properties, body):
+    doc = json.loads(body)
+    print(
+        json.dumps(
+            {
+                "_id": doc.get("_id"),
+                "_rev": doc.get("_rev"),
+                "dtype": doc.get("dtype"),
+                "url": doc.get("url"),
+            },
+            indent=2,
+        )
+    )
+    ch.basic_ack(method.delivery_tag)
+
+
+channel.basic_qos(prefetch_count=10)
+channel.basic_consume(
+    queue=queue_name,
+    on_message_callback=on_message,
+    auto_ack=False,
+)
+
+try:
+    channel.start_consuming()
+finally:
+    connection.close()
+#+end_src
+
+Run it in one terminal:
+
+#+begin_src sh
+uv run python scripts/observe_new_urls.py
+#+end_src
+
+Publish again from another terminal.
+
+The event body should include CouchDB identity/revision data.
+
+* PART V — TURN THE SCRAPER INTO A SCRAPY SPIDER
+
+* 51. Create scrapy.cfg
+
+#+begin_src ini
+[settings]
+default = star_spider.settings
+
+[deploy]
+project = star_spider
+#+end_src
+
+* 52. Create Scrapy settings
+
+Create =star_spider/settings.py=:
+
+#+begin_src python
+BOT_NAME = "star_spider"
+
+SPIDER_MODULES = ["star_spider.spiders"]
+NEWSPIDER_MODULE = "star_spider.spiders"
+
+ROBOTSTXT_OBEY = True
+
+USER_AGENT = "starintel-web-spider/0.1"
+
+CONCURRENT_REQUESTS = 8
+CONCURRENT_REQUESTS_PER_DOMAIN = 2
+
+DOWNLOAD_DELAY = 0.25
+RANDOMIZE_DOWNLOAD_DELAY = True
+
+RETRY_ENABLED = True
+RETRY_TIMES = 3
+
+COOKIES_ENABLED = False
+
+TELNETCONSOLE_ENABLED = False
+
+LOG_LEVEL = "INFO"
+
+ITEM_PIPELINES = {
+    "star_spider.pipelines.RabbitMQPublisherPipeline": 300,
+}
+#+end_src
+
+These are tutorial defaults, not universal crawl settings.
+
+For a public production site, start slower.
+
+* 53. Create an item shape
+
+Create =star_spider/items.py=:
+
+#+begin_src python
+import scrapy
+
+
+class PageItem(scrapy.Item):
+    url = scrapy.Field()
+    title = scrapy.Field()
+    text = scrapy.Field()
+    dataset = scrapy.Field()
+    spider = scrapy.Field()
+    http_status = scrapy.Field()
+    source_url = scrapy.Field()
+    parent_id = scrapy.Field()
+#+end_src
+
+The spider should emit page facts.
+
+The pipeline should convert those facts into StarIntel transport documents.
+
+* 54. Write the first spider
+
+Create =star_spider/spiders/tutorial_site.py=:
+
+#+begin_src python
+from __future__ import annotations
+
+import scrapy
+
+from star_spider.items import PageItem
+
+
+class TutorialSiteSpider(scrapy.Spider):
+    name = "tutorial_site"
+    allowed_domains = ["127.0.0.1"]
+
+    custom_settings = {
+        "DEPTH_LIMIT": 8,
+    }
+
+    def __init__(
+        self,
+        start_url="http://127.0.0.1:8008/index.html",
+        dataset="tutorial-web",
+        parent_id=None,
+        *args,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.start_urls = [start_url]
+        self.dataset = dataset
+        self.parent_id = parent_id
+
+    def parse(self, response):
+        title = response.css("title::text").get(default="")
+        text = " ".join(response.css("body *::text").getall())
+
+        yield PageItem(
+            url=response.url,
+            title=title,
+            text=text,
+            dataset=self.dataset,
+            spider=self.name,
+            http_status=response.status,
+            source_url=response.url,
+            parent_id=self.parent_id,
+        )
+
+        for href in response.css("a::attr(href)").getall():
+            yield response.follow(
+                href,
+                callback=self.parse,
+            )
+#+end_src
+
+* 55. Why this does not loop forever
+
+The fixture graph contains a cycle.
+
+Scrapy's request fingerprinter/scheduler filters duplicate requests by default.
+
+So the sequence is effectively:
+
+#+begin_example
+schedule index
+schedule A
+schedule B
+see index again
+duplicate request fingerprint -> filtered
+#+end_example
+
+We also set =DEPTH_LIMIT= as a second termination control.
+
+Do not confuse URL dedupe with business-document idempotency. They solve
+different duplicate classes.
+
+* 56. Page extraction choices
+
+Our first spider extracts all body text:
+
+#+begin_src python
+text = " ".join(response.css("body *::text").getall())
+#+end_src
+
+That is intentionally broad.
+
+A site-specific spider should usually target meaningful containers:
+
+#+begin_src python
+text = " ".join(response.css("article *::text").getall())
+#+end_src
+
+or:
+
+#+begin_src python
+text = " ".join(response.css("main *::text").getall())
+#+end_src
+
+Generic "extract every visible string" crawling tends to collect navigation,
+cookie banners, and repeated boilerplate.
+
+* 57. Create the RabbitMQ item pipeline
+
+Create =star_spider/pipelines.py=:
+
+#+begin_src python
+from __future__ import annotations
+
+import json
+import os
+
+import pika
+from pika.exceptions import AMQPConnectionError, UnroutableError
+
+from star_spider.starintel import make_url_document
+
+
+class RabbitMQPublisherPipeline:
+    def __init__(self):
+        self.connection = None
+        self.channel = None
+
+    def open_spider(self, spider):
+        self._connect()
+
+    def close_spider(self, spider):
+        if self.connection and self.connection.is_open:
+            self.connection.close()
+
+    def _connect(self):
+        credentials = pika.PlainCredentials(
+            os.environ["STAR_RABBIT_USER"],
+            os.environ["STAR_RABBIT_PASSWORD"],
+        )
+
+        self.connection = pika.BlockingConnection(
+            pika.ConnectionParameters(
+                host=os.environ.get(
+                    "STAR_RABBIT_HOST",
+                    "127.0.0.1",
+                ),
+                port=int(
+                    os.environ.get(
+                        "STAR_RABBIT_PORT",
+                        "5672",
+                    )
+                ),
+                virtual_host="/",
+                credentials=credentials,
+                heartbeat=30,
+                blocked_connection_timeout=30,
+                connection_attempts=3,
+                retry_delay=2,
+            )
+        )
+
+        self.channel = self.connection.channel()
+
+        self.channel.exchange_declare(
+            exchange="documents",
+            exchange_type="topic",
+            durable=True,
+        )
+
+        self.channel.confirm_delivery()
+
+    def process_item(self, item, spider):
+        document = make_url_document(
+            url=item["url"],
+            title=item.get("title", ""),
+            text=item.get("text", ""),
+            dataset=item.get("dataset", "default"),
+            spider=item.get("spider", spider.name),
+            http_status=int(item.get("http_status", 0)),
+            source_url=item.get("source_url"),
+            parent_id=item.get("parent_id"),
+        )
+
+        self._publish(document)
+
+        return item
+
+    def _publish(self, document):
+        if not self.connection or self.connection.is_closed:
+            self._connect()
+
+        dtype = document["dtype"]
+        routing_key = f"documents.ingest.{dtype}"
+
+        body = json.dumps(
+            document,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+        try:
+            self.channel.basic_publish(
+                exchange="documents",
+                routing_key=routing_key,
+                body=body,
+                mandatory=True,
+                properties=pika.BasicProperties(
+                    content_type="application/json",
+                    content_encoding="utf-8",
+                    delivery_mode=2,
+                    type=dtype,
+                    app_id="starintel-web-spider",
+                ),
+            )
+        except (AMQPConnectionError, UnroutableError):
+            # Fail the crawl item instead of pretending it was stored.
+            raise
+#+end_src
+
+* 58. Why the pipeline owns transport
+
+The spider knows:
+
+#+begin_example
+what page am I parsing?
+what links should I follow?
+what page fields did I extract?
+#+end_example
+
+The Rabbit pipeline knows:
+
+#+begin_example
+how do I convert the item?
+what exchange/routing key do I use?
+how do I serialize?
+what AMQP properties do I send?
+did the broker confirm?
+#+end_example
+
+That separation makes it possible to test the spider without RabbitMQ and test
+the publisher without HTML.
+
+* 59. Run the full crawl
+
+Confirm:
+
+1. Project A is healthy.
+2. The fixture HTTP server is running.
+3. Rabbit credentials are exported.
+
+Then:
+
+#+begin_src sh
+cd ~/Projects/starintel-web-spider
+
+uv run scrapy crawl tutorial_site
+#+end_src
+
+You should see the spider fetch approximately:
+
+#+begin_example
+/index.html
+/article-a.html
+/article-b.html
+#+end_example
+
+The back-link to =/index.html= should be filtered as a duplicate request.
+
+* 60. Verify all three pages reached StarIntel
+
+#+begin_src sh
+curl --fail --silent --show-error \
+  --user "$STAR_COUCH_USER:$STAR_COUCH_PASSWORD" \
+  'http://127.0.0.1:5984/starintel/_all_docs?include_docs=true' |
+jq '
+  [
+    .rows[].doc
+    | select(
+        .dtype == "url"
+        and .dataset == "tutorial-web"
+      )
+    | {
+        _id,
+        _rev,
+        url,
+        content
+      }
+  ]
+'
+#+end_src
+
+Each document should have:
+
+- deterministic =_id= from Project B;
+- CouchDB =_rev= from Project A;
+- =dtype=url=;
+- =dataset=tutorial-web=;
+- provenance sources;
+- scraper extension metadata.
+
+* 61. Search through StarIntel
+
+If you have an API key:
+
+#+begin_src sh
+curl --fail --silent --show-error \
+  --header "Authorization: Bearer $STAR_API_KEY" \
+  --get \
+  --data-urlencode 'q=content:RabbitMQ' \
+  http://127.0.0.1:5000/search | jq .
+#+end_src
+
+Clouseau indexing can be asynchronous, so a newly inserted document may not be
+immediately searchable.
+
+Persistence and full-text indexing are separate facts.
+
+* 62. Run the crawl again
+
+#+begin_src sh
+uv run scrapy crawl tutorial_site
+#+end_src
+
+Because the content is identical, Project B generates the same IDs.
+
+The ingest path can observe CouchDB conflicts for those deterministic duplicates
+instead of adding second logical copies.
+
+This is the first real idempotency test.
+
+* 63. Change fixture content
+
+Edit =article-a.html=:
+
+#+begin_src html
+<p class="body">
+  RabbitMQ connects the spider to StarIntel. Version two.
+</p>
+#+end_src
+
+Run the spider again.
+
+The normalized content changes, therefore:
+
+#+begin_example
+content hash changes
+-> snapshot ID changes
+-> new immutable page snapshot
+#+end_example
+
+You can now compare historical page versions without overwriting the earlier
+snapshot.
+
+* PART VI — RELATIONS: TURN A CRAWL INTO A GRAPH
+
+* 64. A crawler naturally discovers edges
+
+If page A links to page B, that is not merely a crawling implementation detail.
+
+It can be a graph fact:
+
+#+begin_example
+A --links-to--> B
+#+end_example
+
+StarIntel already has =links-to= in its relation predicate vocabulary.
+
+So a spider can emit both:
+
+- URL documents;
+- relation documents.
+
+* 65. Separate resource identity from snapshot identity
+
+For a large system, consider two concepts:
+
+#+begin_example
+resource
+  canonical URL identity
+
+snapshot
+  canonical URL + observed content identity
+#+end_example
+
+This tutorial currently stores snapshot-like =url= documents.
+
+When you need stable link relations despite changing content, introduce a
+stable resource identity or map canonical URLs to current snapshots.
+
+Do not hide this modeling problem inside a hash function.
+
+* 66. Build relation documents
+
+A simple tutorial relation shape can be:
+
+#+begin_src python
+import hashlib
+import time
+
+
+def relation_id(source_id: str, target_id: str, predicate: str) -> str:
+    payload = "\0".join(
+        [
+            "starintel-relation-v1",
+            source_id,
+            predicate,
+            target_id,
+        ]
+    ).encode("utf-8")
+
+    return "relation-" + hashlib.sha256(payload).hexdigest()
+
+
+def make_relation(
+    *,
+    dataset: str,
+    source_id: str,
+    target_id: str,
+    predicate: str,
+    note: str,
+) -> dict:
+    now = int(time.time())
+
+    return {
+        "_id": relation_id(
+            source_id,
+            target_id,
+            predicate,
+        ),
+        "dataset": dataset,
+        "dtype": "relation",
+        "sources": ["tutorial_site"],
+        "version": "0.8.0",
+        "dateAdded": now,
+        "dateUpdated": now,
+        "source": source_id,
+        "target": target_id,
+        "predicate": predicate,
+        "note": note,
+    }
+#+end_src
+
+Use =links-to= for hyperlink edges.
+
+Publish relations through:
+
+#+begin_example
+documents.ingest.relation
+#+end_example
+
+not =documents.new.relation=.
+
+* 67. Why relations must also be idempotent
+
+The page may be crawled repeatedly.
+
+If every observation generates a random relation ID, you can create thousands
+of duplicate =links-to= edges.
+
+A deterministic relation ID from:
+
+#+begin_example
+source + predicate + target
+#+end_example
+
+makes repeated observation safe.
+
+If you need a historical observation log, model observation events separately
+instead of turning duplicate graph edges into a timestamp journal.
+
+* 68. Provenance is part of scraping correctness
+
+A scraped fact without provenance is hard to audit.
+
+At minimum preserve:
+
+- canonical source URL;
+- spider name;
+- collection time;
+- content hash;
+- HTTP status;
+- dataset;
+- source/parent identity if this crawl came from a StarIntel target.
+
+For recursive actor networks, the server documentation recommends propagating
+metadata such as:
+
+#+begin_example
+trace_id
+root_id
+parent_id
+actor_path
+depth
+hop
+max_depth
+max_hops
+#+end_example
+
+The server does not automatically add those fields for you.
+
+* 69. Do not put secrets in provenance
+
+Never include:
+
+- RabbitMQ password;
+- CouchDB password;
+- Authorization header;
+- session cookie;
+- bearer token;
+- proxy credential;
+
+inside the document, =sources=, =extensions=, logs, or actor events.
+
+Operational provenance and authentication material are different categories.
+
+* PART VII — HTTP BEHAVIOR OF A REAL SPIDER
+
+* 70. Timeouts are mandatory
+
+A spider without timeouts can accumulate hung requests until the crawl is
+effectively dead.
+
+Scrapy has downloader timeouts. Set a finite value:
+
+#+begin_src python
+DOWNLOAD_TIMEOUT = 20
+#+end_src
+
+Tune it to the target class.
+
+Do not set "infinite because some sites are slow."
+
+* 71. Retry only retryable failures
+
+Typical retry candidates include transient:
+
+- connection resets;
+- some DNS/network errors;
+- 429;
+- 500;
+- 502;
+- 503;
+- 504.
+
+Do not repeatedly retry a permanent parsing error or an authorization denial.
+
+Every retry consumes:
+
+- time;
+- bandwidth;
+- server load;
+- crawl budget.
+
+* 72. Backoff
+
+Scrapy's default retry behavior is not a complete politeness strategy.
+
+For high-value production crawls, track attempt timing and use bounded
+exponential backoff:
+
+#+begin_example
+1s
+2s
+4s
+8s
+stop
+#+end_example
+
+Add jitter when many workers could retry together.
+
+* 73. Handle 429 explicitly
+
+=429 Too Many Requests= means your current request rate is not accepted.
+
+Respect =Retry-After= when present.
+
+Also lower concurrency rather than simply sleeping one request while the rest of
+the worker pool keeps hammering the same host.
+
+* 74. robots.txt
+
+We set:
+
+#+begin_src python
+ROBOTSTXT_OBEY = True
+#+end_src
+
+That is the right default for a general tutorial spider.
+
+A =robots.txt= decision is not the same as legal authorization, but ignoring it
+by accident is poor crawler hygiene.
+
+* 75. Per-domain concurrency
+
+We set:
+
+#+begin_src python
+CONCURRENT_REQUESTS_PER_DOMAIN = 2
+#+end_src
+
+This prevents global concurrency from becoming per-site concurrency.
+
+When scaling to many domains, this lets the crawler remain productive without
+concentrating all requests on one origin.
+
+* 76. Download delay
+
+We set:
+
+#+begin_src python
+DOWNLOAD_DELAY = 0.25
+RANDOMIZE_DOWNLOAD_DELAY = True
+#+end_src
+
+For real sites, 250 ms may still be too aggressive.
+
+Start conservative and tune from observed responses and stated policies.
+
+* 77. User agent
+
+A crawler should not pretend to be Chrome merely because it can.
+
+Use an identifiable agent:
+
+#+begin_example
+starintel-web-spider/0.1
+#+end_example
+
+For a public service you control, include an operator/contact URL or email if
+appropriate.
+
+* 78. Content types
+
+Do not parse every response as HTML.
+
+A production spider should inspect =Content-Type= and route:
+
+#+begin_example
+text/html        -> HTML parser
+application/json -> JSON handler
+application/pdf  -> PDF pipeline
+image/*          -> media pipeline
+other            -> metadata only / skip
+#+end_example
+
+A crawler is a dispatcher over representation types, not just a CSS selector
+engine.
+
+* 79. Response-size ceilings
+
+A malicious or accidental huge response can exhaust memory.
+
+Set maximum response/download sizes appropriate to the job.
+
+Large files should go through a streaming/archive path instead of being loaded
+into one giant string and stored directly inside a StarIntel document.
+
+* 80. HTML is hostile input
+
+Even when you are not executing JavaScript, HTML can be pathological:
+
+- malformed nesting;
+- huge attribute values;
+- millions of nodes;
+- deceptive encodings;
+- compressed bombs;
+- repeated boilerplate.
+
+Treat parser and response limits as part of the security boundary.
+
+* 81. JavaScript-rendered pages
+
+Scrapy fetches HTTP responses. It does not magically execute every JavaScript
+application.
+
+Before adding a browser:
+
+1. inspect network/API calls;
+2. see whether useful data is in initial HTML;
+3. see whether a documented API exists;
+4. see whether embedded JSON is enough.
+
+Browser automation is heavier, less deterministic, and easier to abuse.
+
+Do not make Playwright your default HTTP client.
+
+* PART VIII — PROJECT B AS A STARINTEL EXTERNAL ACTOR
+
+* 82. Why make the spider an external actor?
+
+A normal spider can run from a shell.
+
+A StarIntel external actor can be scheduled by StarIntel dataflow.
+
+The target flow is:
+
+#+begin_example
+target document
+  -> documents.ingest.target
+  -> CouchDB
+  -> documents.new.target
+  -> target router
+  -> actor name lookup
+       |
+       +-- local actor exists -> local Sento tell
+       |
+       +-- no local actor -> actors.<actor>.new.target
+                              |
+                              v
+                       external Rabbit queue
+#+end_example
+
+This lets the same target format address local and external actors.
+
+* 83. Choose the external actor name
+
+Use:
+
+#+begin_example
+web-spider
+#+end_example
+
+Do not register a local actor with that same name in Project A if you want the
+target router to fall through to the remote route.
+
+The remote routing key becomes:
+
+#+begin_example
+actors.web-spider.new.target
+#+end_example
+
+* 84. External actor queue
+
+Project B declares a durable queue:
+
+#+begin_example
+actors.web-spider.targets
+#+end_example
+
+bound to:
+
+#+begin_example
+exchange: documents
+topic:    actors.web-spider.new.target
+#+end_example
+
+This queue is Project B's inbox.
+
+* 85. A target document
+
+A current legacy target contains:
+
+#+begin_src json
+{
+  "_id": "target-web-spider-example",
+  "dataset": "tutorial-web",
+  "dtype": "target",
+  "sources": ["tutorial"],
+  "version": "0.8.0",
+  "dateAdded": 1786590000,
+  "dateUpdated": 1786590000,
+  "actor": "web-spider",
+  "target": "http://127.0.0.1:8008/index.html",
+  "delay": 0,
+  "recurring": false,
+  "options": []
+}
+#+end_src
+
+Publish it to:
+
+#+begin_example
+documents.ingest.target
+#+end_example
+
+The target must be persisted before normal target routing.
+
+* 86. Publish a target manually
+
+Extend the smoke publisher or create =scripts/publish_target.py=.
+
+Core publish:
+
+#+begin_src python
+channel.basic_publish(
+    exchange="documents",
+    routing_key="documents.ingest.target",
+    body=json.dumps(target).encode("utf-8"),
+    mandatory=True,
+    properties=pika.BasicProperties(
+        content_type="application/json",
+        delivery_mode=2,
+        type="target",
+        app_id="starintel-tutorial",
+    ),
+)
+#+end_src
+
+Project A should:
+
+#+begin_example
+persist target
+-> emit documents.new.target
+-> remote route actors.web-spider.new.target
+#+end_example
+
+when =web-spider= is not a registered local actor.
+
+* 87. Minimal target daemon
+
+A simple learning daemon can consume one target at a time and launch the Scrapy
+job.
+
+Create =target_daemon.py=:
+
+#+begin_src python
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+
+import pika
+
+
+QUEUE = "actors.web-spider.targets"
+BINDING = "actors.web-spider.new.target"
+
+
+def connection():
+    credentials = pika.PlainCredentials(
+        os.environ["STAR_RABBIT_USER"],
+        os.environ["STAR_RABBIT_PASSWORD"],
+    )
+
+    return pika.BlockingConnection(
+        pika.ConnectionParameters(
+            host=os.environ.get(
+                "STAR_RABBIT_HOST",
+                "127.0.0.1",
+            ),
+            port=int(
+                os.environ.get(
+                    "STAR_RABBIT_PORT",
+                    "5672",
+                )
+            ),
+            virtual_host="/",
+            credentials=credentials,
+            heartbeat=30,
+        )
+    )
+
+
+conn = connection()
+channel = conn.channel()
+
+channel.exchange_declare(
+    exchange="documents",
+    exchange_type="topic",
+    durable=True,
+)
+
+channel.queue_declare(
+    queue=QUEUE,
+    durable=True,
+)
+
+channel.queue_bind(
+    queue=QUEUE,
+    exchange="documents",
+    routing_key=BINDING,
+)
+
+channel.basic_qos(prefetch_count=1)
+
+
+def on_target(ch, method, properties, body):
+    target = json.loads(body)
+
+    if target.get("dtype") != "target":
+        ch.basic_nack(
+            method.delivery_tag,
+            requeue=False,
+        )
+        return
+
+    url = target.get("target")
+    dataset = target.get("dataset", "default")
+    parent_id = target.get("_id", "")
+
+    if not isinstance(url, str) or not url.startswith(
+        ("http://", "https://")
+    ):
+        ch.basic_nack(
+            method.delivery_tag,
+            requeue=False,
+        )
+        return
+
+    command = [
+        sys.executable,
+        "-m",
+        "scrapy",
+        "crawl",
+        "tutorial_site",
+        "-a",
+        f"start_url={url}",
+        "-a",
+        f"dataset={dataset}",
+        "-a",
+        f"parent_id={parent_id}",
+    ]
+
+    completed = subprocess.run(
+        command,
+        check=False,
+    )
+
+    if completed.returncode == 0:
+        ch.basic_ack(method.delivery_tag)
+    else:
+        ch.basic_nack(
+            method.delivery_tag,
+            requeue=True,
+        )
+
+
+channel.basic_consume(
+    queue=QUEUE,
+    on_message_callback=on_target,
+    auto_ack=False,
+)
+
+print(f"waiting on {QUEUE} / {BINDING}")
+
+try:
+    channel.start_consuming()
+finally:
+    conn.close()
+#+end_src
+
+* 88. Why the tutorial daemon launches a subprocess
+
+This implementation is intentionally easy to understand.
+
+It creates one clean Scrapy process per target.
+
+Tradeoffs:
+
+- simple lifecycle;
+- strong isolation between jobs;
+- expensive process startup;
+- only one target at a time with =prefetch_count=1=;
+- not ideal for high-throughput crawling.
+
+A production service can run a long-lived job supervisor using Scrapy's
+=CrawlerRunner= or another worker architecture.
+
+Learn the message contract first. Optimize the process model second.
+
+* 89. ACK only after the crawl succeeds
+
+The target daemon uses:
+
+#+begin_example
+crawl return code == 0 -> ACK
+crawl failure          -> NACK / requeue
+#+end_example
+
+ACKing immediately when the target is received would mean:
+
+#+begin_quote
+Rabbit thinks the job is complete even if the spider crashes one second later.
+#+end_quote
+
+That is an easy way to lose work.
+
+* 90. But requeue forever is also wrong
+
+This tutorial daemon requeues failures for clarity.
+
+Production must classify failures.
+
+Examples:
+
+**Permanent**
+
+- invalid URL;
+- unsupported scheme;
+- explicitly denied target;
+- malformed target;
+- site removed and policy says do not retry.
+
+**Transient**
+
+- temporary Rabbit outage;
+- DNS outage;
+- 503;
+- transient network reset.
+
+Permanent failures should not bounce forever.
+
+Use:
+
+- dead-letter exchange;
+- bounded retry count;
+- retry queues with delay;
+- terminal actor event.
+
+The current core server does not create your external actor DLQ for you.
+
+* 91. Start the external actor
+
+Terminal 1:
+
+#+begin_src sh
+uv run python target_daemon.py
+#+end_src
+
+Terminal 2:
+
+publish a =target= document for =web-spider=.
+
+You should see the target daemon launch the spider.
+
+The spider then publishes URL documents back through:
+
+#+begin_example
+documents.ingest.url
+#+end_example
+
+You now have recursive distributed dataflow.
+
+* 92. The full target-driven loop
+
+#+begin_example
+Project A
+  target document
+      |
+      v
+documents.ingest.target
+      |
+      v
+CouchDB
+      |
+      v
+documents.new.target
+      |
+      v
+target router
+      |
+      v
+actors.web-spider.new.target
+      |
+      v
+Project B external actor
+      |
+      v
+Scrapy crawl
+      |
+      v
+documents.ingest.url
+      |
+      v
+Project A ingest
+      |
+      v
+CouchDB
+      |
+      v
+documents.new.url
+#+end_example
+
+This is the point where a "scraper script" becomes part of an actor/dataflow
+system.
+
+* 93. Recurring targets
+
+A target can set:
+
+#+begin_src json
+{
+  "recurring": true,
+  "delay": 3600
+}
+#+end_src
+
+That means intentional repeated work.
+
+Use a stable target ID.
+
+Make every crawl idempotent.
+
+Never use a zero-delay recurring target as a retry mechanism.
+
+A zero-delay recursive loop can turn the system into a message amplifier.
+
+* 94. Target options
+
+Legacy target =options= is actor-defined.
+
+For a spider you might define a closed contract such as:
+
+#+begin_src json
+[
+  {
+    "max_depth": 3,
+    "allowed_domains": ["example.org"],
+    "extract": "article"
+  }
+]
+#+end_src
+
+Do not let arbitrary target options become arbitrary Python imports, shell
+commands, or dynamically evaluated code.
+
+Treat options as data and validate them.
+
+* PART IX — RELIABILITY AND MESSAGE SEMANTICS
+
+* 95. At-least-once across two layers
+
+Project B has at least two retry domains:
+
+#+begin_example
+HTTP retry domain
+Rabbit delivery retry domain
+#+end_example
+
+They are not the same.
+
+A page can be fetched twice due to HTTP retry logic.
+
+A resulting document can be delivered twice due to Rabbit processing.
+
+Deterministic identity should tolerate both.
+
+* 96. Publisher failure before confirm
+
+Possible sequence:
+
+#+begin_example
+Project B sends bytes
+connection fails
+Project B does not know whether broker accepted them
+#+end_example
+
+This is an outcome-uncertain window.
+
+Retrying may duplicate the publish.
+
+That is why the document itself must be idempotent.
+
+Do not make network transport uncertainty disappear by pretending it cannot
+happen.
+
+* 97. Consumer crash after side effect
+
+Possible Project A sequence:
+
+#+begin_example
+receive document
+write CouchDB
+crash before ACK
+Rabbit re-delivers
+#+end_example
+
+Again, deterministic identity prevents a second logical insert.
+
+Exactly-once behavior is an application property built from idempotency and
+state, not a magical Rabbit switch.
+
+* 98. Prefetch
+
+A consumer prefetch controls how many unacknowledged deliveries can be in
+flight.
+
+Our target daemon sets:
+
+#+begin_src python
+channel.basic_qos(prefetch_count=1)
+#+end_src
+
+That is deliberately conservative because each target launches a whole crawl.
+
+A lightweight transformation worker could use a larger prefetch.
+
+* 99. Backpressure
+
+Suppose spiders produce faster than StarIntel can persist.
+
+RabbitMQ becomes the buffer.
+
+But a buffer is finite in reality.
+
+Watch:
+
+- queue depth;
+- message bytes;
+- consumer rate;
+- publish rate;
+- CouchDB write latency;
+- disk free space.
+
+"Rabbit is buffering it" is not a capacity plan.
+
+* 100. Rabbit connection reuse
+
+Do not open a new AMQP TCP connection for every scraped item.
+
+Our pipeline opens one connection in =open_spider= and closes it in
+=close_spider=.
+
+That is far cheaper than:
+
+#+begin_example
+page
+-> TCP connect
+-> AMQP handshake
+-> auth
+-> channel
+-> one message
+-> close
+#+end_example
+
+for every page.
+
+* 101. Connection recovery
+
+The tutorial pipeline reconnects if it notices a closed connection before a
+publish.
+
+A stronger production publisher also handles:
+
+- mid-publish connection loss;
+- channel closure;
+- broker restart;
+- heartbeat timeout;
+- bounded reconnect backoff;
+- confirm uncertainty;
+- graceful drain on shutdown.
+
+Keep that code in the transport layer.
+
+* 102. Message size
+
+Do not send multi-megabyte raw websites through RabbitMQ merely because AMQP can
+carry bytes.
+
+A scalable design often uses:
+
+#+begin_example
+object store / archive -> raw body
+StarIntel document     -> metadata + extracted content + archive reference
+RabbitMQ               -> bounded work/event envelope
+#+end_example
+
+RabbitMQ is a broker, not your blob store.
+
+* 103. Transient work
+
+The server recognizes =transient: true= and filters it out of standard ingest
+and update consumers.
+
+Use transient messages for intermediate work that should not enter CouchDB.
+
+Do not use =transient= for evidence that must be reproducible.
+
+* 104. Updates
+
+The current server update path consumes the =documents.updated.#= topic family.
+
+Use an update when you are changing an existing durable identity rather than
+creating a new snapshot.
+
+The server:
+
+- requires =_id= and =dtype=;
+- refetches current state;
+- deep-merges the patch;
+- uses the latest =_rev=;
+- retries conflicts;
+- emits the updated revision.
+
+For our immutable page snapshot tutorial, new content creates a new document, so
+we do not need updates yet.
+
+* PART X — RECURSION AND LOOP CONTROL
+
+* 105. Crawlers are recursive systems
+
+A spider is recursion expressed as dataflow:
+
+#+begin_example
+page
+  -> discovered link
+     -> page
+        -> discovered link
+           -> page
+              ...
+#+end_example
+
+StarIntel actors are also recursive dataflow.
+
+Combining them means you have recursion at two levels:
+
+#+begin_example
+crawler recursion
++ actor graph recursion
+#+end_example
+
+That deserves explicit budgets.
+
+* 106. Crawl depth
+
+Scrapy:
+
+#+begin_src python
+DEPTH_LIMIT = 8
+#+end_src
+
+This bounds hyperlink traversal depth.
+
+StarIntel actor metadata may have its own:
+
+#+begin_example
+depth
+max_depth
+hop
+max_hops
+#+end_example
+
+Do not reuse Rabbit delivery count as either one.
+
+* 107. Actor path
+
+If one StarIntel actor launches another, maintain:
+
+#+begin_example
+actor_path = [
+  "seed",
+  "web-spider",
+  "content-classifier"
+]
+#+end_example
+
+A non-repeatable actor should not invoke itself indefinitely.
+
+Crawler link cycles and actor cycles are separate checks.
+
+* 108. Fixed points
+
+A page normalization pipeline can stop producing a new derived document when:
+
+#+begin_example
+normalized output hash == previous output hash
+#+end_example
+
+This is a fixed point.
+
+Fixed-point thinking is useful for recursive enrichment systems:
+
+#+begin_example
+input
+-> enrichment
+-> enrichment
+-> no semantic change
+-> stop
+#+end_example
+
+* 109. Crawl budgets
+
+Add explicit job limits:
+
+#+begin_example
+max pages
+max bytes downloaded
+max depth
+max wall time
+max errors
+max retries
+max domains
+#+end_example
+
+A crawl that has no termination budget is not production-ready.
+
+* PART XI — OBSERVABILITY
+
+* 110. What to log from Project B
+
+Useful:
+
+#+begin_example
+crawl_id
+target_id
+request_url
+canonical_url
+status
+elapsed_ms
+bytes
+snapshot_id
+publish_routing_key
+publish_confirmed
+retry_count
+#+end_example
+
+Avoid logging full response bodies by default.
+
+* 111. What to measure
+
+Counters:
+
+#+begin_example
+requests_total
+responses_total
+pages_emitted_total
+rabbit_publish_total
+rabbit_publish_failures_total
+duplicate_requests_filtered_total
+http_retries_total
+parse_failures_total
+#+end_example
+
+Gauges:
+
+#+begin_example
+crawl_frontier_size
+rabbit_connection_state
+active_requests
+#+end_example
+
+Histograms:
+
+#+begin_example
+download_latency
+parse_latency
+publish_latency
+page_bytes
+#+end_example
+
+* 112. Actor events
+
+External services may also emit events through:
+
+#+begin_example
+exchange: events
+routing:  event.<actor>
+#+end_example
+
+The current server has an actor-event consumer for the =events= exchange.
+
+Use actor events for important lifecycle facts, not a log line for every HTML
+node.
+
+Examples:
+
+#+begin_example
+crawl_started
+crawl_completed
+crawl_failed
+budget_exhausted
+target_rejected
+#+end_example
+
+* 113. Trace identity
+
+When a crawl was launched by a StarIntel target, use one trace ID across:
+
+#+begin_example
+target
+-> external actor delivery
+-> crawl
+-> URL documents
+-> relations
+-> downstream actors
+#+end_example
+
+That lets you reconstruct one distributed derivation later.
+
+* PART XII — TESTING THE SPIDER PROPERLY
+
+* 114. Test layers
+
+Use four layers:
+
+#+begin_example
+1. pure normalization tests
+2. spider parse tests
+3. Rabbit integration tests
+4. full Project A + Project B end-to-end
+#+end_example
+
+Do not rely only on "I ran the spider and saw stuff."
+
+* 115. Pure tests
+
+Already covered:
+
+- canonical URL;
+- whitespace normalization;
+- deterministic ID;
+- changed content;
+- document shape.
+
+These should not require network, RabbitMQ, or CouchDB.
+
+* 116. Spider parse test
+
+You can test a callback with a local response object.
+
+Example:
+
+#+begin_src python
+from scrapy.http import HtmlResponse, Request
+
+from star_spider.spiders.tutorial_site import TutorialSiteSpider
+
+
+def test_parse_emits_item_and_links():
+    html = b"""
+    <html>
+      <head><title>A</title></head>
+      <body>
+        <article><p>Hello</p></article>
+        <a href="/b.html">B</a>
+      </body>
+    </html>
+    """
+
+    request = Request(
+        "http://127.0.0.1:8008/a.html"
+    )
+
+    response = HtmlResponse(
+        request=request,
+        url=request.url,
+        body=html,
+        encoding="utf-8",
+    )
+
+    spider = TutorialSiteSpider()
+    output = list(spider.parse(response))
+
+    items = [
+        value
+        for value in output
+        if not isinstance(value, Request)
+    ]
+
+    requests = [
+        value
+        for value in output
+        if isinstance(value, Request)
+    ]
+
+    assert len(items) == 1
+    assert items[0]["title"] == "A"
+
+    assert len(requests) == 1
+    assert requests[0].url.endswith("/b.html")
+#+end_src
+
+No RabbitMQ required.
+
+* 117. Rabbit integration test
+
+For a transport test:
+
+1. start RabbitMQ;
+2. create a temporary queue bound to =documents.ingest.url=;
+3. invoke the pipeline publisher;
+4. consume one message;
+5. assert JSON shape and properties.
+
+This tests Project B's AMQP boundary without requiring CouchDB.
+
+* 118. Full end-to-end test
+
+The strongest acceptance path is:
+
+#+begin_example
+start Project A
+start fixture site
+run Project B spider
+wait for crawl completion
+query CouchDB
+assert three tutorial-web URL docs
+assert _rev present
+assert duplicate rerun does not create duplicate same-content IDs
+change fixture content
+rerun
+assert new snapshot appears
+#+end_example
+
+That is an actual integration test, not a unit test with mocks.
+
+* 119. Test broker restart
+
+A serious transport test should restart RabbitMQ while Project B is active.
+
+Observe:
+
+- whether heartbeat detects failure;
+- whether publish fails visibly;
+- whether reconnect is bounded;
+- whether uncertain publishes remain idempotent.
+
+Do not call a reconnect loop robust until you have killed the broker under it.
+
+* 120. Test Project A restart
+
+StarIntel's own stack test restarts the Compose stack and checks persistence.
+
+For Project B:
+
+1. crawl once;
+2. restart Project A;
+3. wait for health;
+4. crawl again;
+5. verify deterministic IDs and durable data remain correct.
+
+* PART XIII — DEBUGGING PLAYBOOK
+
+* 121. Spider gets connection refused on port 8008
+
+Check:
+
+#+begin_src sh
+curl http://127.0.0.1:8008/index.html
+#+end_src
+
+If that fails, RabbitMQ is irrelevant.
+
+Fix the fixture HTTP server.
+
+* 122. Spider parses no links
+
+Inspect:
+
+#+begin_src python
+response.css("a::attr(href)").getall()
+#+end_src
+
+Then inspect the actual response body.
+
+Do not change Rabbit routing because a CSS selector returned nothing.
+
+* 123. Rabbit authentication fails
+
+Check the variables:
+
+#+begin_src sh
+env | grep '^STAR_RABBIT_'
+#+end_src
+
+Verify the password file path:
+
+#+begin_src sh
+wc -c ~/Projects/starintel-server/secrets/rabbitmq_password
+#+end_src
+
+Do not print secrets into a bug report.
+
+* 124. Rabbit publish is unroutable
+
+Confirm Project A is running and has declared the ingest queue/binding.
+
+Check Rabbit management UI.
+
+Expected:
+
+#+begin_example
+exchange documents
+queue documents.ingest
+binding documents.ingest.#
+#+end_example
+
+If Project B starts against a completely fresh broker before Project A has
+declared its consumer queue, =mandatory=True= can expose the mistake.
+
+* 125. Queue grows forever
+
+Possible causes:
+
+- star-server unhealthy;
+- CouchDB unavailable;
+- ingest consumer repeatedly NACKing;
+- malformed document;
+- too few workers;
+- publisher rate exceeds durable write rate.
+
+Inspect Project A logs before scaling Project B harder.
+
+* 126. Document never appears in CouchDB
+
+Check:
+
+1. was publish confirmed?
+2. did message route to =documents.ingest=?
+3. did =dtype= exist?
+4. did star-server log parse/insert errors?
+5. did CouchDB return conflict or bad request?
+6. is the document =transient:true=?
+
+Trace one ID through each layer.
+
+* 127. Document is in CouchDB but observer sees nothing
+
+Make sure observer bound to:
+
+#+begin_example
+documents.new.url
+#+end_example
+
+not:
+
+#+begin_example
+documents.ingest.url
+#+end_example
+
+Also ensure the observer was running before the event unless its queue is
+durable and retained.
+
+Our tutorial observer uses an exclusive temporary queue, so it sees only live
+events.
+
+* 128. Search does not show new document
+
+Check CouchDB first.
+
+If the document exists there, wait for indexing and inspect Clouseau/search.
+
+Persistence success and full-text visibility are not the same event.
+
+* 129. Duplicate documents appear
+
+Ask:
+
+- is =_id= deterministic?
+- is content normalized before hashing?
+- is URL canonicalized?
+- does a timestamp participate in the ID?
+- does nondeterministic field ordering participate in the hash?
+- are redirects producing multiple canonical URLs?
+
+Never put =time.time()= into deterministic identity input.
+
+* 130. Crawl loops
+
+Inspect:
+
+- canonical URL function;
+- query parameter explosion;
+- =DEPTH_LIMIT=;
+- Scrapy duplicate-filter stats;
+- calendar/search/faceted navigation traps.
+
+A site can generate infinitely many unique URLs even when request deduplication
+is working perfectly.
+
+* 131. Crawl is too slow
+
+Measure before changing concurrency.
+
+Possible bottlenecks:
+
+#+begin_example
+remote HTTP
+HTML parsing
+item pipeline
+Rabbit confirm latency
+StarIntel/CouchDB ingest
+local CPU
+DNS
+#+end_example
+
+If Rabbit publish confirms are the bottleneck, increasing HTTP concurrency may
+only make memory/backpressure worse.
+
+* 132. Crawl is too fast for the target
+
+Lower:
+
+#+begin_example
+CONCURRENT_REQUESTS_PER_DOMAIN
+DOWNLOAD_DELAY
+#+end_example
+
+Honor 429/Retry-After.
+
+A high scrape rate is not automatically a performance win.
+
+* PART XIV — HARDEN PROJECT B
+
+* 133. Validate items before publish
+
+Before transport, require:
+
+#+begin_example
+non-empty dtype
+non-empty dataset
+absolute canonical URL
+finite content size
+known extension shape
+deterministic ID
+#+end_example
+
+Fail locally.
+
+Do not send obviously malformed documents merely to see whether Project A
+accepts them.
+
+* 134. Bound content length
+
+For example:
+
+#+begin_src python
+MAX_CONTENT_CHARS = 200_000
+
+content = normalize_text(content)
+
+if len(content) > MAX_CONTENT_CHARS:
+    content = content[:MAX_CONTENT_CHARS]
+#+end_src
+
+Better systems preserve truncation metadata:
+
+#+begin_src json
+{
+  "truncated": true,
+  "original_chars": 481233,
+  "stored_chars": 200000
+}
+#+end_src
+
+Silent truncation destroys auditability.
+
+* 135. Preserve raw hashes
+
+Even if raw HTML is stored elsewhere, record:
+
+#+begin_example
+raw_body_sha256
+normalized_text_sha256
+#+end_example
+
+Then you can distinguish:
+
+- response changed;
+- normalization changed;
+- extraction changed.
+
+* 136. Archive raw pages separately
+
+A mature architecture:
+
+#+begin_example
+HTTP response
+   |
+   +--> immutable raw archive / object storage
+   |
+   +--> normalized StarIntel url document
+           |
+           +--> archive URI
+           +--> body hash
+           +--> parser version
+#+end_example
+
+This makes parsers re-runnable without re-contacting the source site.
+
+* 137. Version the parser
+
+Add:
+
+#+begin_src json
+{
+  "extensions": {
+    "scraper": {
+      "parser": "tutorial-html",
+      "parser_version": "1"
+    }
+  }
+}
+#+end_src
+
+When extraction logic changes, provenance can explain why two normalizations
+differ.
+
+* 138. Domain allowlists
+
+A target-driven spider must not blindly crawl any URL a message can inject if
+the deployment intends a restricted scope.
+
+Validate against an explicit allowlist:
+
+#+begin_example
+allowed schemes
+allowed domains
+allowed ports
+blocked private networks when appropriate
+#+end_example
+
+Server-side request forgery risks apply to crawlers too.
+
+* 139. IP and hostname policy
+
+If targets can be untrusted, consider blocking:
+
+- loopback;
+- link-local;
+- cloud metadata endpoints;
+- internal management networks;
+
+unless the crawler is explicitly an internal-network collector authorized to
+reach them.
+
+The local fixture is loopback because this is a controlled tutorial.
+
+Do not copy that policy unchanged into a public multi-user service.
+
+* 140. Redirect policy
+
+A permitted starting URL can redirect to a forbidden destination.
+
+Validate redirect destinations against the same network/domain policy.
+
+Scope applies after redirects too.
+
+* 141. Credentials and authenticated crawling
+
+If a crawler must use credentials:
+
+- isolate them per target/site;
+- never persist them in normal StarIntel page documents;
+- redact request/response headers from logs;
+- make cookie jars scoped;
+- encrypt secrets at rest;
+- define who is authorized to launch that crawl.
+
+Do not turn a general target document into a plaintext password envelope.
+
+* PART XV — SCALING
+
+* 142. First scaling strategy: more Project B workers
+
+Rabbit external actors are natural horizontal services.
+
+Instead of one process doing everything:
+
+#+begin_example
+actors.web-spider.targets
+  -> worker 1
+  -> worker 2
+  -> worker 3
+#+end_example
+
+Use competing consumers on the same queue for target-level parallelism.
+
+Each crawl still enforces per-domain politeness.
+
+* 143. Do not multiply per-domain load accidentally
+
+If you run ten workers and each allows two requests per domain, the actual
+aggregate can become twenty concurrent requests to one domain.
+
+Global service-level rate limiting must account for all workers.
+
+Per-process settings are not a distributed rate limiter.
+
+* 144. Partition by domain when necessary
+
+At larger scale, consider routing or scheduling targets by canonical host:
+
+#+begin_example
+example.org -> worker partition A
+example.net -> worker partition B
+#+end_example
+
+This makes distributed politeness and caches easier to reason about.
+
+* 145. Separate target queue from page frontier
+
+RabbitMQ is excellent for coarse jobs:
+
+#+begin_example
+crawl this site / target
+#+end_example
+
+Scrapy's scheduler is better for a spider's internal page frontier.
+
+Do not put every single discovered hyperlink into the global StarIntel target
+queue unless you actually need cross-process global scheduling.
+
+Use the right queue at the right granularity.
+
+* 146. Separate CPU-heavy parsing
+
+If extraction becomes CPU-heavy:
+
+#+begin_example
+fetch worker
+-> raw artifact
+-> parser worker
+-> StarIntel documents
+#+end_example
+
+Do not block HTTP download concurrency on an expensive NLP transform if the
+tasks can be decoupled.
+
+* 147. Batch versus single-message ingest
+
+Single-document Rabbit messages are simple and observable.
+
+Batching can improve throughput but complicates:
+
+- retry granularity;
+- partial failure;
+- idempotency;
+- max message size;
+- traceability.
+
+Start with one document per message.
+
+Measure before batching.
+
+* PART XVI — STRICT 0.9 MIGRATION
+
+* 148. Why this tutorial did not invent a strict 0.9 url object
+
+The server's documentation explicitly warns that the current Rabbit ingest path
+does not call the strict 0.9 validator.
+
+The exact canonical 0.9 schema should come from the StarIntel conformance/spec
+repository, not from our memory.
+
+Therefore the tutorial's runnable bridge uses fields that the current server
+documents exactly.
+
+That is more honest than writing a "0.9" object that merely looks plausible.
+
+* 149. Migration plan
+
+When moving Project B to strict 0.9:
+
+1. pin the canonical 0.9 schema;
+2. generate/use the official language adapter if available;
+3. choose the canonical =dtype=;
+4. validate locally before publish;
+5. preserve extensions under the allowed extension boundary;
+6. add conformance fixtures;
+7. test Rabbit round-trip preservation;
+8. test CouchDB round-trip preservation;
+9. verify downstream actors understand the nested =data= shape;
+10. only then switch the active producer.
+
+* 150. Do not silently normalize dtype aliases
+
+Strict 0.9 rejects legacy aliases rather than silently converting them.
+
+That is good.
+
+A distributed system should not have three producers disagreeing about the
+canonical type while one server guesses what they meant.
+
+Normalize explicitly at a versioned compatibility boundary.
+
+* PART XVII — PROJECT FILES TO KEEP
+
+* 151. Add a Makefile
+
+Create =Makefile=:
+
+#+begin_src makefile
+.PHONY: test fixture spider smoke target-daemon
+
+test:
+	uv run pytest -q
+
+fixture:
+	uv run python -m http.server 8008 \
+		--bind 127.0.0.1 \
+		--directory fixtures/site
+
+spider:
+	uv run scrapy crawl tutorial_site
+
+smoke:
+	uv run python scripts/publish_smoke.py
+
+target-daemon:
+	uv run python target_daemon.py
+#+end_src
+
+Now the learning loop is:
+
+#+begin_src sh
+make test
+make fixture
+make smoke
+make spider
+make target-daemon
+#+end_src
+
+* 152. Add .gitignore
+
+#+begin_src gitignore
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+.scrapy/
+dist/
+#+end_src
+
+Do not ignore source fixtures.
+
+Do ignore runtime state.
+
+* 153. Suggested README for Project B
+
+#+begin_src markdown
+# StarIntel Web Spider
+
+External crawler actor for StarIntel.
+
+## Input
+
+RabbitMQ target:
+
+- exchange: `documents`
+- routing key: `actors.web-spider.new.target`
+- queue: `actors.web-spider.targets`
+
+## Output
+
+Durable StarIntel documents:
+
+- exchange: `documents`
+- routing key: `documents.ingest.<dtype>`
+
+## Local development
+
+```sh
+nix develop
+uv sync
+make test
+make fixture
+make spider
+```
+#+end_src
+
+The README should describe transport contracts before implementation trivia.
+
+* PART XVIII — OPERATIONAL CHECKLIST
+
+* 154. Before every local crawl
+
+- [ ] Project A health passes.
+- [ ] RabbitMQ is bound to loopback.
+- [ ] CouchDB is bound to loopback.
+- [ ] fixture or authorized target is reachable.
+- [ ] Rabbit credentials are loaded from secret files.
+- [ ] no credentials are in Git.
+- [ ] crawl depth is finite.
+- [ ] page budget is finite.
+- [ ] per-domain concurrency is finite.
+- [ ] user agent is intentional.
+- [ ] output IDs are deterministic.
+- [ ] source/dataset are set.
+- [ ] item validation passes.
+- [ ] tests pass.
+
+* 155. Before crawling a real public site
+
+- [ ] Confirm authorization/legal basis.
+- [ ] Read site terms/policies relevant to automated access.
+- [ ] Inspect =robots.txt=.
+- [ ] Set conservative rate.
+- [ ] Set =DOWNLOAD_TIMEOUT=.
+- [ ] Set response-size limits.
+- [ ] Restrict allowed domains.
+- [ ] Restrict redirect destinations.
+- [ ] Decide what sensitive fields must not be collected.
+- [ ] Decide retention.
+- [ ] Decide raw archive policy.
+- [ ] Add monitoring.
+- [ ] Add bounded retries.
+- [ ] Add dead-letter handling.
+- [ ] Add shutdown/drain behavior.
+
+* 156. Before calling Project B production-ready
+
+- [ ] Rabbit reconnect tested by killing Rabbit.
+- [ ] Project A restart tested mid-run.
+- [ ] duplicate delivery tested.
+- [ ] duplicate target tested.
+- [ ] invalid target dead-letters.
+- [ ] 429 handling tested.
+- [ ] 500/503 retry tested.
+- [ ] 404 permanent behavior defined.
+- [ ] redirect scope tested.
+- [ ] DNS failure tested.
+- [ ] huge response rejected/truncated safely.
+- [ ] malformed HTML tested.
+- [ ] queue saturation observed.
+- [ ] metrics exported.
+- [ ] traces correlate target -> pages.
+- [ ] secrets redacted.
+- [ ] strict schema migration plan documented.
+
+* PART XIX — TWO COMPLETE PROJECT WALKTHROUGHS
+
+* 157. Project A final walkthrough
+
+Start fresh:
+
+#+begin_src sh
+cd ~/Projects/starintel-server
+
+nix run .#load-images
+docker compose up -d --wait --wait-timeout 300
+
+curl --fail --silent http://127.0.0.1:5000/health | jq .
+#+end_src
+
+Load passwords:
+
+#+begin_src sh
+export STAR_RABBIT_PASSWORD="$(cat secrets/rabbitmq_password)"
+export STAR_COUCH_PASSWORD="$(cat secrets/couchdb_password)"
+#+end_src
+
+Check services:
+
+#+begin_src sh
+docker compose ps
+#+end_src
+
+Project A is now the durable backend.
+
+* 158. Project B final walkthrough
+
+Terminal A — local website:
+
+#+begin_src sh
+cd ~/Projects/starintel-web-spider
+nix develop
+uv sync
+make fixture
+#+end_src
+
+Terminal B — observe persisted events:
+
+#+begin_src sh
+cd ~/Projects/starintel-web-spider
+
+export STAR_RABBIT_HOST=127.0.0.1
+export STAR_RABBIT_PORT=5672
+export STAR_RABBIT_USER=starintel
+export STAR_RABBIT_PASSWORD="$(
+  cat ~/Projects/starintel-server/secrets/rabbitmq_password
+)"
+
+uv run python scripts/observe_new_urls.py
+#+end_src
+
+Terminal C — crawl:
+
+#+begin_src sh
+cd ~/Projects/starintel-web-spider
+
+export STAR_RABBIT_HOST=127.0.0.1
+export STAR_RABBIT_PORT=5672
+export STAR_RABBIT_USER=starintel
+export STAR_RABBIT_PASSWORD="$(
+  cat ~/Projects/starintel-server/secrets/rabbitmq_password
+)"
+
+uv run scrapy crawl tutorial_site
+#+end_src
+
+Terminal D — inspect CouchDB:
+
+#+begin_src sh
+export STAR_COUCH_USER=admin
+export STAR_COUCH_PASSWORD="$(
+  cat ~/Projects/starintel-server/secrets/couchdb_password
+)"
+
+curl --silent \
+  --user "$STAR_COUCH_USER:$STAR_COUCH_PASSWORD" \
+  'http://127.0.0.1:5984/starintel/_all_docs?include_docs=true' |
+jq '
+  .rows[].doc
+  | select(
+      .dtype == "url"
+      and .dataset == "tutorial-web"
+    )
+'
+#+end_src
+
+That is the complete Project A -> Project B integration.
+
+* 159. Project B target-driven walkthrough
+
+Terminal A — target daemon:
+
+#+begin_src sh
+cd ~/Projects/starintel-web-spider
+uv run python target_daemon.py
+#+end_src
+
+Terminal B — publish a target:
+
+#+begin_example
+exchange: documents
+key: documents.ingest.target
+body.actor: web-spider
+body.target: http://127.0.0.1:8008/index.html
+#+end_example
+
+Expected path:
+
+#+begin_example
+target
+-> Project A persists target
+-> target router emits actors.web-spider.new.target
+-> Project B receives target
+-> Scrapy crawls local fixture
+-> Project B emits documents.ingest.url
+-> Project A persists page documents
+-> observers receive documents.new.url
+#+end_example
+
+You have now built a distributed scraper actor.
+
+* PART XX — EXERCISES
+
+* 160. Exercise: only crawl articles
+
+Change the spider so it follows links broadly but emits =PageItem= only when the
+response contains:
+
+#+begin_example
+<article>
+#+end_example
+
+Keep request discovery and item emission as separate decisions.
+
+* 161. Exercise: canonical link
+
+If a page has:
+
+#+begin_src html
+<link rel="canonical" href="https://example.org/story">
+#+end_src
+
+prefer it only after validating it against your domain/scope policy.
+
+Record both fetched URL and canonical URL in provenance.
+
+* 162. Exercise: relation emission
+
+For every followed link:
+
+1. normalize destination URL;
+2. identify source/destination resource;
+3. emit a deterministic =links-to= relation;
+4. verify repeated crawls do not duplicate the relation.
+
+* 163. Exercise: content change relation
+
+When a canonical URL produces a new snapshot, emit:
+
+#+begin_example
+new-snapshot --related-to--> previous-snapshot
+#+end_example
+
+or introduce a more precise version predicate if the canonical StarIntel
+predicate inventory supports it.
+
+Do not invent a predicate and silently assume every adapter accepts it.
+
+* 164. Exercise: crawl budget
+
+Add settings or spider state for:
+
+#+begin_example
+max_pages = 100
+max_total_bytes = 50 MiB
+max_errors = 10
+#+end_example
+
+Stop gracefully and emit a terminal actor event when a budget is exceeded.
+
+* 165. Exercise: dead-letter queue
+
+Create:
+
+#+begin_example
+actors.web-spider.targets.dlx
+actors.web-spider.targets.dead
+#+end_example
+
+Configure rejected terminal targets to dead-letter instead of disappearing or
+requeueing forever.
+
+* 166. Exercise: retry queue
+
+Design a delayed retry path:
+
+#+begin_example
+main target queue
+  -> transient failure
+  -> retry queue with TTL
+  -> dead-letter back to main queue
+#+end_example
+
+Keep a retry count in message headers or actor metadata.
+
+Set a finite maximum.
+
+* 167. Exercise: multiple external spider workers
+
+Start two target daemons on the same durable queue.
+
+Publish multiple independent targets.
+
+Observe competing-consumer behavior.
+
+Then think carefully about aggregate per-domain request rate.
+
+* 168. Exercise: raw archive
+
+Save raw HTML under a content-addressed path:
+
+#+begin_example
+archive/sha256/ab/cd/<digest>.html
+#+end_example
+
+Put only the archive reference and hash in the StarIntel document.
+
+Verify rerunning extraction from the archive yields the same normalized result.
+
+* 169. Exercise: strict 0.9 adapter
+
+Locate the canonical current 0.9 schema.
+
+Write a converter:
+
+#+begin_example
+ScrapedPage
+-> canonical strict 0.9 URL-like document
+-> local schema validation
+-> Rabbit publish
+#+end_example
+
+Do not disable validation to make the test pass.
+
+* PART XXI — DESIGN QUESTIONS
+
+* 170. Should RabbitMQ carry every discovered link?
+
+Usually no.
+
+Use the Scrapy frontier for page-level crawling unless a link must become global
+distributed work.
+
+Rabbit targets are better for coarse durable jobs.
+
+* 171. Should the spider write CouchDB directly?
+
+For this architecture, no.
+
+That would bypass:
+
+- StarIntel ingest routing;
+- post-insert events;
+- a single document-flow boundary;
+- future validation/enforcement;
+- actor subscriptions.
+
+Project B should publish to RabbitMQ and let Project A own persistence.
+
+* 172. Should the spider call the StarIntel HTTP API instead?
+
+It can be a useful boundary for some clients.
+
+But the user goal in this tutorial is explicitly to learn the RabbitMQ actor
+path.
+
+Use RabbitMQ when building an external actor/service intended to participate in
+distributed StarIntel messaging.
+
+* 173. Should RabbitMQ be exposed publicly?
+
+No by default.
+
+The Compose configuration binds it to loopback for a reason.
+
+For remote actors:
+
+- private network;
+- VPN/tunnel;
+- least-privilege Rabbit user/vhost;
+- explicit TLS support;
+- firewall;
+- credential rotation.
+
+The current StarIntel Rabbit client documentation warns that merely switching
+to port 5671 does not prove verified TLS has been configured.
+
+* 174. Why not use auto_ack?
+
+Because receipt is not completion.
+
+If Project B receives a target, auto-ACKs it, then crashes during crawl, the
+broker cannot redeliver the target.
+
+Manual ACK lets the actor define completion.
+
+* 175. Why not ACK after the first page?
+
+Because the target represents a crawl job.
+
+Define the target's success condition.
+
+For this tutorial it is:
+
+#+begin_quote
+The Scrapy job process exits successfully after its required publishes.
+#+end_quote
+
+A production actor can use finer job/checkpoint semantics.
+
+* 176. Why not make each page a target?
+
+You can, but that turns the global actor system into the crawl frontier.
+
+That may be useful for:
+
+- distributed page ownership;
+- global dedup;
+- long-lived crawl scheduling.
+
+It also adds:
+
+- huge Rabbit traffic;
+- more persistence;
+- more actor recursion;
+- more difficult politeness.
+
+Choose it intentionally.
+
+* PART XXII — GLOSSARY
+
+* 177. Scraper
+
+Code that extracts structured data from fetched content.
+
+* 178. Crawler
+
+A system that discovers and schedules more resources while traversing a graph of
+links.
+
+* 179. Spider
+
+A crawler policy/component, especially in Scrapy, that defines seeds, parsing,
+and link-following behavior.
+
+* 180. Crawl frontier
+
+Discovered work not yet fully processed.
+
+* 181. Canonical URL
+
+A normalized representation used to reason about URL identity.
+
+* 182. Idempotent
+
+Safe to repeat without creating unintended duplicate logical effects.
+
+* 183. Exchange
+
+RabbitMQ routing entity that receives publishes and routes them to queues.
+
+* 184. Topic exchange
+
+An exchange that matches routing keys against dot-separated binding patterns.
+
+StarIntel's =documents= exchange is a topic exchange.
+
+* 185. Queue
+
+RabbitMQ storage/delivery endpoint consumed by workers.
+
+* 186. Routing key
+
+The topic string attached to a publish.
+
+Examples:
+
+#+begin_example
+documents.ingest.url
+documents.new.url
+actors.web-spider.new.target
+#+end_example
+
+* 187. ACK
+
+Consumer acknowledgement that a Rabbit delivery completed successfully.
+
+* 188. NACK
+
+Negative acknowledgement. It may requeue or reject/dead-letter depending on
+configuration.
+
+* 189. Publisher confirm
+
+Broker acknowledgement of a publish.
+
+It is not the same as application-level persistence in CouchDB.
+
+* 190. CouchDB revision
+
+The =_rev= value attached by CouchDB to a stored document revision.
+
+* 191. Snapshot
+
+An immutable observation of a resource at a point/version of content.
+
+* 192. Provenance
+
+Metadata and relations describing where a document came from and how it was
+derived.
+
+* PART XXIII — COMPLETION CHECKLIST
+
+* 193. You understand Project A when...
+
+- [ ] You can start the four-service Compose stack.
+- [ ] You know where the six local secret files live.
+- [ ] You can explain why ports default to loopback.
+- [ ] You can pass =/health=.
+- [ ] You know Rabbit's =documents= exchange is a durable topic exchange.
+- [ ] You know the =documents.ingest= queue binds =documents.ingest.#=.
+- [ ] You know =documents.ingest.url= means "persist this URL document."
+- [ ] You know =documents.new.url= means "post-insert URL event."
+- [ ] You can inspect a persisted document and its =_rev=.
+- [ ] You can explain at-least-once delivery.
+
+* 194. You understand Project B when...
+
+- [ ] You can explain scraper vs crawler vs spider.
+- [ ] You can run the local fixture site.
+- [ ] You can extract a page without Scrapy.
+- [ ] You can explain why we graduate to Scrapy.
+- [ ] You can canonicalize a URL.
+- [ ] You can normalize page text.
+- [ ] You can generate deterministic page snapshot IDs.
+- [ ] You can publish one JSON document to Rabbit.
+- [ ] You can use persistent messages and publisher confirms.
+- [ ] You can crawl the fixture cycle without looping forever.
+- [ ] You can publish through an item pipeline.
+- [ ] You can rerun the crawl idempotently.
+- [ ] You can observe =documents.new.url=.
+- [ ] You can generate graph relations.
+- [ ] You can consume =actors.web-spider.new.target=.
+- [ ] You ACK only after required work succeeds.
+- [ ] You can classify retryable vs terminal failures.
+- [ ] You can describe a dead-letter strategy.
+- [ ] You understand distributed per-domain rate limits.
+- [ ] You can explain the strict 0.9 migration boundary.
+
+* 195. Final mental model
+
+The shortest correct mental model is:
+
+#+begin_example
+The spider owns collection.
+
+RabbitMQ owns distributed delivery.
+
+StarIntel Server owns durable ingest.
+
+CouchDB owns document revisions.
+
+Actors own recursive derivation.
+
+Deterministic identity makes retries safe.
+#+end_example
+
+And the concrete path you built is:
+
+#+begin_example
+HTTP page
+  -> Scrapy
+  -> normalized StarIntel URL snapshot
+  -> documents.ingest.url
+  -> RabbitMQ
+  -> StarIntel ingest consumer
+  -> CouchDB
+  -> documents.new.url
+  -> downstream actors
+
+StarIntel target
+  -> documents.ingest.target
+  -> target router
+  -> actors.web-spider.new.target
+  -> Project B
+  -> crawl
+  -> more durable documents
+#+end_example
+
+That is a scraper/spider integrated as a real StarIntel external actor rather
+than a one-off script.

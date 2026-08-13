@@ -1,0 +1,66 @@
+:PROPERTIES:
+:ID:       e28942c8-14c7-48dc-82d0-e63a0f08c168
+:END:
+#+title: StarIntel Server
+#+filetags: :project:starintel:common-lisp:rabbitmq:couchdb:actors:
+#+property: repo https://github.com/lost-rob0t/starintel-server
+#+property: source_ref master
+#+property: verified_against e2fa1991d8b08b74bcb2194c7a10f02da2431ad1
+#+property: verified_on 2026-08-13
+
+* What it is
+
+StarIntel Server is the persistent backend and distributed actor/dataflow layer
+for StarIntel. The current stack combines Common Lisp actor/runtime code with
+RabbitMQ for distributed document traffic, CouchDB for durable documents,
+Clouseau for full-text search, and HTTP APIs for authenticated access.
+
+* Core document flow
+
+#+begin_example
+producer
+  -> RabbitMQ exchange: documents
+  -> documents.ingest.<dtype>
+  -> StarIntel ingest consumer
+  -> CouchDB
+  -> _id / _rev enrichment
+  -> documents.new.<dtype>
+  -> downstream actors and services
+#+end_example
+
+The main RabbitMQ exchange is =documents= and is a durable topic exchange.
+Initial ingest is consumed from =documents.ingest= bound to
+=documents.ingest.#=.
+
+* External actors
+
+An external actor normally binds its own durable queue to one or more topics on
+the =documents= exchange. A persisted target for an actor that is not registered
+locally is routed as:
+
+#+begin_example
+actors.<actor-name>.new.target
+#+end_example
+
+External actors publish durable derived documents back through:
+
+#+begin_example
+documents.ingest.<dtype>
+#+end_example
+
+They must be idempotent because Rabbit processing is at least once.
+
+* Current document boundary
+
+The server currently spans strict StarIntel 0.9 schema-driven documents and
+legacy flat 0.8-style Common Lisp documents. The current HTTP/Rabbit ingest path
+does not itself run the strict 0.9 validator. New producers should still use a
+versioned, explicit compatibility boundary rather than depending on permissive
+ingest forever.
+
+* Tutorial
+
+See [[id:d4453dbf-e72e-4876-998d-9549937fe71b][StarIntel Scrapers and Spiders from Zero: Project A Server, Project B RabbitMQ Crawler]].
+
+That tutorial builds the real server stack as Project A and a Scrapy/RabbitMQ
+external crawler actor as Project B.
