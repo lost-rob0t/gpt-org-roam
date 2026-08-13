@@ -37,6 +37,7 @@ jobs:
           id_re = re.compile(r'^:ID:\s+([^\s]+)\s*$', re.MULTILINE)
           link_re = re.compile(r'\[\[id:([^\]]+)\]')
           title_re = re.compile(r'^#\+title:\s+.+$', re.MULTILINE | re.IGNORECASE)
+          tutorial_name_re = re.compile(r'^\d{2}-[a-z0-9]+(?:-[a-z0-9]+)+\.org$')
 
           ids = {}
           contents = {}
@@ -57,8 +58,15 @@ jobs:
                       sys.exit(f'duplicate Org-roam ID {value}: {ids[value]} and {path}')
                   ids[value] = path
 
-              if path.parts and path.parts[0] == 'tutorials' and not title_re.search(text):
-                  sys.exit(f'{path}: tutorial is missing #+title')
+              if path.parts and path.parts[0] == 'tutorials':
+                  if not title_re.search(text):
+                      sys.exit(f'{path}: tutorial is missing #+title')
+                  if not tutorial_name_re.fullmatch(path.name):
+                      sys.exit(
+                          f'{path}: tutorial filename must match '
+                          'NN-<project>-<slug>.org (for example '
+                          '00-starlang-from-zero.org)'
+                      )
 
           for path, text in contents.items():
               for target in link_re.findall(text):
