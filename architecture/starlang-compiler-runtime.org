@@ -1,0 +1,229 @@
+:PROPERTIES:
+:ID:       dca7bf46-7062-4e34-bfaf-8bec6e520a42
+:END:
+#+title: StarLang Compiler and Runtime Architecture
+#+filetags: :starlang:architecture:compiler:runtime:actors:
+#+property: repo https://github.com/lost-rob0t/star-lang
+#+property: source_ref main
+
+* Architectural boundary
+
+StarLang separates source semantics from runtime implementation details. The important invariant is that normalized IR is data-only and runtime-neutral. CL-GServer/Sento operations belong behind runtime/adapter boundaries rather than being encoded into StarLang IR.
+
+This makes the compiler capable of producing portable contracts/manifests while allowing the runtime to evolve its concrete process, transport, journaling, and supervision implementation.
+
+* Front-end call graph
+
+The public facade in =prototype/star-lang-api.lisp= exposes:
+
+#+begin_src lisp
+star-lang.api:read-star-syntax
+star-lang.api:expand-star-syntax
+star-lang.api:validate-star-core
+star-lang.api:compile-star-core
+star-lang.api:load-star
+star-lang.api:load-star-file
+star-lang.api:load-star-url
+#+end_src
+
+Conceptually:
+
+#+begin_example
+source bytes
+    |
+    v
+read-star-syntax
+    |  produces STAR-SYNTAX nodes + source spans
+    v
+locked import resolution
+    |
+    v
+expand-star-syntax
+    |  hygienic/bounded declarative expansion
+    v
+validate-star-core
+    |  rejects invalid declarations/types/fields/actors
+    v
+compile-star-core
+    |
+    v
+normalized IR v2
+    |
+    +--> portable manifests / generated bindings
+    |
+    +--> runtime loading
+#+end_example
+
+The normalized IR schema is currently =org.star-lang/normalized-ir@2=.
+
+* Syntax objects instead of Lisp forms
+
+=prototype/core-surface-prototype.lisp= defines =star-syntax=. A syntax node carries more than a datum:
+
+- kind;
+- datum;
+- children;
+- source span;
+- lexical scopes;
+- origin chain;
+- macro introduction metadata;
+- expansion trace;
+- macro dependency metadata.
+
+That is the security and tooling reason =.star= source is not simply =READ= by Common Lisp. =star-syntax-to-datum= is intentionally lossy: once converted to plain data, occurrence identity, spans, scopes, origins, and introduction metadata are gone.
+
+* Parser resource limits
+
+The parser has explicit limits. Current defaults include approximately:
+
+- 16 MiB source bytes;
+- nesting depth 128;
+- 100,000 syntax nodes;
+- 65,536-byte tokens;
+- 4 MiB strings;
+- 100,000 collection elements;
+- bounded numeric literal size and magnitude.
+
+These are part of the language boundary, not incidental implementation details. Any new parser feature must preserve bounded resource use.
+
+* Error model
+
+The core uses structured conditions such as:
+
+- =star-lang-source-error=;
+- =invalid-library-error=;
+- =invalid-declaration-error=;
+- =invalid-field-error=;
+- =invalid-type-error=;
+- =invalid-actor-error=;
+- =invalid-envelope-error=;
+- =unsupported-macro-error=.
+
+Errors can retain phase, span, origin, syntax kind, related spans, and details. When extending the compiler, prefer adding structured validation errors over throwing generic strings.
+
+* Runtime layering
+
+The current transitional ASDF load order reveals the runtime decomposition:
+
+#+begin_example
+core surface
+ -> macro expansion
+ -> actor wire protocol
+ -> core semantics
+ -> canonical JSON
+ -> message lifecycle
+ -> binding generation
+ -> deterministic dispatcher
+ -> deferred completion / idempotency identity
+ -> transport port + transport adapter
+ -> runtime directory
+ -> domain server
+ -> journal / remoting / lease boundaries
+ -> CL-GServer compatibility facade
+ -> compiler IR + spec domain
+ -> loader
+ -> document runtime
+ -> constructor runtime
+ -> public API
+#+end_example
+
+The final target splits those responsibilities into independent systems such as =star-journal=, =star-mailbox=, =star-supervisor=, =star-adapter-sdk=, =starlang-compiler=, and =starlang-runtime=.
+
+* Document runtime
+
+The document runtime compiles document declarations into contracts and provides:
+
+#+begin_src lisp
+(star-lang.api:create-document graph "person"
+  '(("fname" . "Ada")
+    ("lname" . "Lovelace"))
+  :dataset "people")
+
+(star-lang.api:encode-document document :key-style :camel :couchdb t)
+(star-lang.api:decode-document graph "person" encoded)
+(star-lang.api:relate-documents graph source destination
+  :predicate "member-of")
+#+end_src
+
+ID generation supports ULID, UUIDv4, and deterministic digest IDs. Digest IDs canonicalize their input, so equivalent maps with different key order produce the same digest.
+
+* Actor/runtime model
+
+StarLang's runtime is actor-oriented. The main implementation boundaries to study are:
+
+- wire envelopes and actor contracts;
+- deterministic dispatcher;
+- per-actor directory resolution;
+- mailbox/single-message processing;
+- deferred completion;
+- idempotency identity;
+- journaling and replay;
+- leases for remote/runtime ownership;
+- supervision and restart behavior;
+- adapter ports for side effects.
+
+A useful mental model is:
+
+#+begin_example
+portable StarLang contract
+        |
+        v
+actor manifest / message contracts
+        |
+        v
+runtime directory -> actor identity
+        |
+        v
+deterministic dispatcher
+        |
+        v
+mailbox / actor execution
+        |
+        +--> journal
+        +--> capabilities
+        +--> adapter ports
+        +--> external side effects
+#+end_example
+
+* Service URI direction
+
+PR #14 introduces a logical service identity:
+
+#+begin_example
+star://domain:address:actor-name
+#+end_example
+
+Examples under that branch include:
+
+#+begin_example
+star://quasar:localhost:user-hunt
+star://bbp:localhost:nmap
+#+end_example
+
+The design goal is to keep logical actor identity independent from Sento, RabbitMQ, HTTP, or another transport. Because that work is not on main at this writing, code against the mainline actor/runtime API unless explicitly testing the feature branch.
+
+* Tests are executable architecture
+
+The authoritative test contract is ASDF:
+
+#+begin_src sh
+sbcl --non-interactive \
+  --eval '(require :asdf)' \
+  --eval '(asdf:load-system :starlang-prototype)' \
+  --eval '(asdf:test-system :starlang-prototype)' \
+  --eval '(sb-ext:quit)'
+#+end_src
+
+The Nix contract is:
+
+#+begin_src sh
+nix flake check -L
+#+end_src
+
+Each prototype test script is run in a fresh SBCL child process. This matters: package/order bugs that accidentally pass in an already-loaded image are supposed to fail CI.
+
+* Related nodes
+
+- [[id:1111004a-95fd-488b-979b-e8433431e299][StarLang]]
+- [[id:c91d5283-f96e-4d95-92f6-a926ea6951f5][StarLang Spec Libraries and Portable Contracts]]
+- [[id:41d65192-9402-4597-940d-3fb304e6ebc9][StarLang from Zero: Compiler, Contracts, Documents, and Durable Actors]]

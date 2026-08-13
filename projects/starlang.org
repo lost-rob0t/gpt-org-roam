@@ -1,0 +1,70 @@
+:PROPERTIES:
+:ID:       1111004a-95fd-488b-979b-e8433431e299
+:END:
+#+title: StarLang
+#+filetags: :starlang:common-lisp:actors:project:
+#+property: repo https://github.com/lost-rob0t/star-lang
+#+property: source_ref main
+
+* What StarLang is
+
+StarLang is the Common Lisp-only compiler and durable actor runtime used as a reusable runtime layer for StarIntel. The authoritative working implementation currently lives in =prototype/= under the =starlang-prototype= ASDF system while the code is incrementally extracted into final =star-*= and =starlang-*= systems.
+
+StarLang is deliberately not implemented by feeding =.star= files to the Common Lisp reader. Its source is parsed by a closed parser, expanded through bounded declarative macros, validated, and compiled into normalized runtime-neutral IR.
+
+* Core pipeline
+
+#+begin_example
+UTF-8 source bytes
+  -> read-star-syntax
+  -> locked import resolution
+  -> expand-star-syntax
+  -> validate-star-core
+  -> compile-star-core
+  -> normalized runtime-neutral IR
+#+end_example
+
+See [[id:dca7bf46-7062-4e34-bfaf-8bec6e520a42][StarLang Compiler and Runtime Architecture]].
+
+* Main subsystems
+
+- =starlang-compiler=: parser, syntax objects, validation, normalized IR, manifest generation.
+- =starlang-runtime=: durable execution and runtime-facing APIs.
+- =star-actor-protocol=: actor message/protocol definitions.
+- =star-mailbox=: per-actor mailbox semantics.
+- =star-supervisor=: supervision trees and restart strategies.
+- =star-journal=: durable journal/replay boundary.
+- =star-lease=: time-bound actor/resource leases.
+- =star-capability=: capability/authorization surface.
+- =star-artifact=: artifact/provenance handling.
+- =star-adapter-sdk=: inbound/outbound adapter boundary.
+- =star-http-port= and =star-process-port=: concrete external ports.
+- =star-canonical-json=: deterministic JSON interchange.
+- =star-sento-compat=: compatibility boundary to Sento / CL-GServer.
+
+* Source landmarks
+
+- =README.md= -- current architecture/status.
+- =starlang-prototype.asd= -- authoritative transitional load order.
+- =prototype/core-surface-prototype.lisp= -- parser/compiler surface, syntax objects, errors, limits.
+- =prototype/macro-expander-prototype.lisp= -- hygienic declarative expansion.
+- =prototype/compiler-ir-prototype.lisp= -- normalized IR work.
+- =prototype/star-loader.lisp= -- source/library loading and import resolution.
+- =prototype/document-runtime.lisp= -- document construction, IDs, encoding, decoding.
+- =prototype/constructor-runtime.lisp= -- generated/installed Common Lisp constructors.
+- =prototype/star-lang-api.lisp= -- public convenience API.
+- =prototype/deterministic-dispatcher-prototype.lisp= -- deterministic actor dispatch.
+- =prototype/runtime-directory-prototype.lisp= -- actor/runtime directory boundary.
+- =fixtures/*.star= -- concrete language examples.
+
+* Current status
+
+The project explicitly describes itself as not yet fully conformant with the approved STAR-LANG research sequence 000-009. Do not confuse an approved design with completed implementation.
+
+The =star://domain:address:actor-name= service URI work exists on the =agent/star-service-uri= branch / PR #14 at the time this tutorial node was authored. Treat it as incoming until merged.
+
+* Learn it
+
+Start with [[id:41d65192-9402-4597-940d-3fb304e6ebc9][StarLang from Zero: Compiler, Contracts, Documents, and Durable Actors]].
+
+For the data-contract model, see [[id:c91d5283-f96e-4d95-92f6-a926ea6951f5][StarLang Spec Libraries and Portable Contracts]].
