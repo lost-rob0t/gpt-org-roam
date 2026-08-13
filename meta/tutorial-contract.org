@@ -1,0 +1,89 @@
+:PROPERTIES:
+:ID:       e7ef9343-c232-4981-a6ac-9ec04d310bb1
+:END:
+#+title: Tutorial Generation Contract
+#+filetags: :meta:contract:tutorials:
+
+* Authorization command
+
+There is one explicit command that authorizes creation of a new tutorial:
+
+#+begin_example
+make tutorial
+#+end_example
+
+Wording that unambiguously includes that command for a subject also authorizes
+that tutorial, for example:
+
+#+begin_example
+make tutorial for prolog-rlm
+make tutorial explaining Zara MCP servers
+make tutorial for this feature
+#+end_example
+
+Use immediate conversation context to resolve the subject.  Do not require the
+user to repeat context that is already available.
+
+* No inferred tutorial generation
+
+Without explicit authorization, do nothing to this repository merely because:
+
+- a feature was completed;
+- a PR merged;
+- a project was discussed;
+- research was performed;
+- code was modified;
+- documentation would be useful;
+- a tool is complicated;
+- the material seems educational.
+
+This repository is intentionally curated rather than automatically updated.
+
+* Authorized workflow
+
+After =make tutorial=:
+
+1. determine the subject from current context;
+2. inspect the real current implementation and relevant tests/configuration;
+3. identify prerequisites and existing reusable nodes;
+4. create the technical Org tutorial under =tutorials/=;
+5. create or update the canonical project index when applicable;
+6. create only genuinely missing reusable support nodes;
+7. link the graph with persistent =id:= links;
+8. record source metadata when version sensitivity matters;
+9. run =make validate=;
+10. report what changed and what source revision was taught.
+
+* Tutorial quality floor
+
+Authorized tutorials should explain enough machinery to support modification,
+debugging, extension, or reimplementation.  Use realistic code, execution-flow
+traces, source maps, debugging procedures, failure modes, and minimal examples
+when they improve understanding.
+
+A strong default structure is:
+
+#+begin_example
+* What this is
+* Why it exists
+* Mental model
+* Architecture
+* Important components
+* Execution flow
+* Code walkthrough
+* Using it
+* Building a minimal example
+* Debugging it
+* Common failure modes
+* How to extend it
+* Source map
+* Related nodes
+#+end_example
+
+Adapt the structure to the subject instead of forcing irrelevant sections.
+
+* Bootstrap state
+
+The repository bootstrap contains no project-specific tutorial.  Until the user
+issues =make tutorial=, the tutorial directory remains intentionally empty apart
+from its Git placeholder.

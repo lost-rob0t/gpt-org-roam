@@ -1,0 +1,96 @@
+:PROPERTIES:
+:ID:       884953d0-edf7-4274-b054-c3d6e930c9f0
+:END:
+#+title: gpt-org-roam
+#+filetags: :meta:org-roam:
+
+* Purpose
+
+=gpt-org-roam= is a centralized technical Org-roam knowledge graph generated and
+maintained by an AI for a human programmer to read.
+
+It exists to explain how projects, tools, libraries, architectures, protocols,
+and development workflows actually work at implementation depth.  It is not a
+replacement for project-local READMEs, release notes, or changelogs.
+
+Start at [[id:bcf8cc98-9878-4345-95fc-108ac493b54d][Knowledge Base Index]].
+
+* Critical tutorial contract
+
+Tutorials are generated only after an explicit =make tutorial= instruction.
+
+Without that authorization, do not add a project tutorial merely because a
+feature was implemented, a PR merged, a repository was discussed, code was
+changed, or documentation would be useful.
+
+The complete contract lives at
+[[id:e7ef9343-c232-4981-a6ac-9ec04d310bb1][Tutorial Generation Contract]].
+
+* Layout
+
+- =projects/= :: canonical project index nodes created when a project first gets
+  documented.
+- =concepts/= :: reusable concepts shared across projects.
+- =architecture/= :: architectural mechanisms and cross-cutting designs.
+- =workflows/= :: operational and development workflows.
+- =tutorials/= :: explicitly authorized technical tutorials.
+- =references/= :: source-oriented reference material.
+- =meta/= :: authoring rules and repository conventions.
+- =tools/= :: small repository-local Emacs utilities.
+
+Empty directories contain =.gitkeep= files until real nodes are added.
+
+* Open with Org-roam
+
+The repository is intentionally usable as an independent Org-roam database.
+
+A direct Emacs setup is:
+
+#+begin_src emacs-lisp
+(setq org-roam-directory
+      (file-truename "~/Documents/Projects/gpt-org-roam"))
+(org-roam-db-sync)
+#+end_src
+
+A repository-local helper is also available:
+
+#+begin_src emacs-lisp
+(load-file "~/Documents/Projects/gpt-org-roam/tools/org-roam.el")
+(gpt-org-roam-use-repository)
+#+end_src
+
+Useful commands:
+
+- =M-x org-roam-node-find=
+- =M-x org-roam-node-insert=
+- =M-x org-roam-buffer-toggle=
+- =M-x org-roam-db-sync=
+
+* Validation
+
+Run:
+
+#+begin_src shell
+make validate
+#+end_src
+
+The validator checks the tracked knowledge base for obvious structural errors:
+
+- malformed Org syntax detectable by the Org parser;
+- duplicate persistent IDs;
+- Org files without a persistent ID;
+- broken local =id:= links;
+- unbalanced source blocks;
+- Markdown files accidentally placed under =tutorials/=.
+
+It uses Emacs/Org only; Org-roam itself is not required for validation.
+
+* Authoring
+
+See:
+
+- [[id:4ef1435d-26ff-4e5d-8299-55dca77ac9bd][Authoring Technical Nodes]]
+- [[id:ef486266-c5d2-45ad-b81d-a5d239f874cc][Knowledge Base Conventions]]
+- [[id:e7ef9343-c232-4981-a6ac-9ec04d310bb1][Tutorial Generation Contract]]
+
+Project-specific tutorials are deliberately absent from the bootstrap.
