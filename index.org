@@ -9,6 +9,7 @@
 
 * Tutorials
 - [[id:41d65192-9402-4597-940d-3fb304e6ebc9][StarLang from Zero: Compiler, Contracts, Documents, and Durable Actors]]
+- [[id:de17f55f-3d3b-4dcd-b99f-55e272ccdd4c][Prolog-RLM from Zero: Contexts, Typed Plans, Agents, Graphs, and Recursive LLMs]]
 
 * Architecture
 - [[id:dca7bf46-7062-4e34-bfaf-8bec6e520a42][StarLang Compiler and Runtime Architecture]]
