@@ -1,0 +1,610 @@
+:PROPERTIES:
+:ID:       b16d2476-2bcb-4b5f-a521-1b6e37c3db09
+:END:
+#+title: Prolog-RLM Quickstart: Run It, Call It, and Use Your First RLM
+#+filetags: :prolog:rlm:tutorial:quickstart:swi-prolog:llm:
+#+property: repo https://github.com/lost-rob0t/prolog-rlm
+#+property: source_ref main
+#+property: verified_against f8671d041a2851b9655795d1461384707bea9bd7
+#+property: verified_on 2026-08-13
+
+* Goal
+
+This is the *easy* Prolog-RLM tutorial.
+
+You do not need to understand agents, graphs, MCP, typed plan internals, or recursive-language-model research first.
+
+By the end, you will know how to:
+
+1. download =prolog-rlm=;
+2. check that it loads;
+3. run the built-in demo without an API key;
+4. make a normal LLM call;
+5. make an RLM call with external context;
+6. load =prolog-rlm= as a Prolog library;
+7. call it from your own =.pl= file.
+
+If you want the large architecture tutorial after this one, read
+[[id:de17f55f-3d3b-4dcd-b99f-55e272ccdd4c][Prolog-RLM from Zero: Contexts, Typed Plans, Agents, Graphs, and Recursive LLMs]].
+
+* 1. What is Prolog-RLM?
+
+=prolog-rlm= is a language-model harness written in SWI-Prolog.
+
+For the first tutorial, think of it like this:
+
+#+begin_example
+your question
+    |
+    v
+prolog-rlm
+    |
+    +--> normal LLM call
+    |
+    +--> RLM call using external context
+    |
+    +--> later: tools, agents, graphs, traces, MCP
+#+end_example
+
+A normal LLM call sends a prompt to a model.
+
+An RLM call gives the runtime a question plus some external context and lets the Prolog runtime control how that work is executed.
+
+The important part is that the harness already exists. You do *not* need to build one before using the library.
+
+* 2. What you need
+
+You need:
+
+- Git;
+- SWI-Prolog 9.0 or newer;
+- an API key only when you want a real hosted model call.
+
+Check SWI-Prolog:
+
+#+begin_src sh
+swipl --version
+#+end_src
+
+If that prints a SWI-Prolog version, continue.
+
+On Ubuntu, SWI-Prolog is normally installed through the system package manager:
+
+#+begin_src sh
+sudo apt update
+sudo apt install swi-prolog
+#+end_src
+
+Then check again:
+
+#+begin_src sh
+swipl --version
+#+end_src
+
+* 3. Clone Prolog-RLM
+
+#+begin_src sh
+git clone https://github.com/lost-rob0t/prolog-rlm.git
+cd prolog-rlm
+#+end_src
+
+Everything in this tutorial assumes your shell is now in the repository root.
+
+* 4. Make sure the runtime loads
+
+Run the runtime check:
+
+#+begin_src sh
+swipl -q -s test/check_runtime.pl
+#+end_src
+
+Then check that the whole module graph loads:
+
+#+begin_src sh
+swipl -q -s test/load_all.pl
+#+end_src
+
+If both commands finish successfully, the library is loadable.
+
+You can also run the deterministic tests:
+
+#+begin_src sh
+swipl -q -s test/run_tests.pl
+#+end_src
+
+* 5. Your first run: no API key
+
+The easiest way to see Prolog-RLM working is the built-in demo:
+
+#+begin_src sh
+swipl -q -s bin/prolog-rlm.pl -- demo
+#+end_src
+
+This does *not* require OpenRouter credentials.
+
+It exercises the real runtime with deterministic demo data.
+
+If you only want one tiny demo, try the context demo:
+
+#+begin_src sh
+swipl -q -s bin/prolog-rlm.pl -- demo context
+#+end_src
+
+Other built-in demos include:
+
+#+begin_src sh
+swipl -q -s bin/prolog-rlm.pl -- demo tool
+swipl -q -s bin/prolog-rlm.pl -- demo recursion
+swipl -q -s bin/prolog-rlm.pl -- agent
+swipl -q -s bin/prolog-rlm.pl -- graph
+swipl -q -s bin/prolog-rlm.pl -- mcp
+#+end_src
+
+To see every CLI command:
+
+#+begin_src sh
+swipl -q -s bin/prolog-rlm.pl -- help
+#+end_src
+
+At this point you have already used the harness.
+
+* 6. Make one real LLM call
+
+The default hosted provider is OpenRouter.
+
+Set your key:
+
+#+begin_src sh
+export OPENROUTER_API_KEY='your-key-here'
+#+end_src
+
+Now make a direct model call:
+
+#+begin_src sh
+swipl -q -s bin/prolog-rlm.pl -- direct "Reply with HELLO_PROLOG_RLM"
+#+end_src
+
+That is the simplest real model path:
+
+#+begin_example
+prompt
+  |
+  v
+prolog-rlm CLI
+  |
+  v
+llm_query/3
+  |
+  v
+OpenRouter
+  |
+  v
+structured result
+#+end_example
+
+If you want to pick the model explicitly:
+
+#+begin_src sh
+swipl -q -s bin/prolog-rlm.pl -- direct \
+  "Reply with HELLO_PROLOG_RLM" \
+  --model openrouter/free
+#+end_src
+
+There is no silent fake-provider fallback. If the credential or provider call fails, the command fails instead of pretending a real model answered.
+
+* 7. Your first RLM call
+
+Now give Prolog-RLM a question *and* external context.
+
+Run:
+
+#+begin_src sh
+swipl -q -s bin/prolog-rlm.pl -- rlm \
+  "What secret token is in the context?" \
+  --context "The secret token is RLM_CONTEXT_42."
+#+end_src
+
+The important difference is:
+
+#+begin_example
+direct
+  prompt ---> model
+
+rlm
+  question + external context
+          |
+          v
+    Prolog RLM runtime
+          |
+          v
+   bounded child model call
+          |
+          v
+        result
+#+end_example
+
+The CLI's current =rlm= command runs a bounded depth-1 RLM path.
+
+Try another:
+
+#+begin_src sh
+swipl -q -s bin/prolog-rlm.pl -- rlm \
+  "What animal does Alice own?" \
+  --context "Alice owns a capybara. Bob owns a cat."
+#+end_src
+
+* 8. Use a file as the external context
+
+Create a tiny file:
+
+#+begin_src sh
+cat > notes.txt <<'EOF'
+Server: quasar-01
+Role: graph API
+Secret test word: ORBITAL
+EOF
+#+end_src
+
+Ask about it:
+
+#+begin_src sh
+swipl -q -s bin/prolog-rlm.pl -- rlm \
+  "What is the secret test word?" \
+  --context-file ./notes.txt
+#+end_src
+
+This is the first useful RLM pattern to remember:
+
+#+begin_example
+large or external data
+        |
+        v
+  keep it as context
+        |
+        v
+ ask a focused question
+        |
+        v
+ bounded RLM execution
+#+end_example
+
+* 9. Call Prolog-RLM from the SWI-Prolog REPL
+
+Start SWI-Prolog from the repository root:
+
+#+begin_src sh
+swipl
+#+end_src
+
+Load the public module:
+
+#+begin_src prolog
+?- use_module('prolog/rlm').
+true.
+#+end_src
+
+Ask for the runtime version:
+
+#+begin_src prolog
+?- rlm_version(Version).
+Version = '0.1.0-dev'.
+#+end_src
+
+Check that the public runtime is ready:
+
+#+begin_src prolog
+?- rlm_ready.
+true.
+#+end_src
+
+Run all deterministic demos through the library API:
+
+#+begin_src prolog
+?- demo_all(Result).
+#+end_src
+
+Or just run the context demo:
+
+#+begin_src prolog
+?- demo_context(Result).
+#+end_src
+
+That is important: the CLI is only a thin front end. You can call the same runtime directly as Prolog predicates.
+
+* 10. Call a real LLM from Prolog
+
+Make sure the key is present in the shell that started SWI-Prolog:
+
+#+begin_src sh
+export OPENROUTER_API_KEY='your-key-here'
+swipl
+#+end_src
+
+Load the library:
+
+#+begin_src prolog
+?- use_module('prolog/rlm').
+true.
+#+end_src
+
+Now call =llm_query/3=:
+
+#+begin_src prolog
+?- llm_query("Reply with PROLOG_API_OK", [], Outcome).
+#+end_src
+
+The three arguments are:
+
+#+begin_example
+llm_query(Prompt, Options, Outcome)
+          ^       ^        ^
+          |       |        returned structured result
+          |       options
+          prompt
+#+end_example
+
+An empty option list uses the default OpenRouter provider configuration.
+
+For learning, it is fine to print or inspect the complete =Outcome= term first. Later you can pattern-match only the fields your program needs.
+
+* 11. The RLM library calls
+
+The public module exports two deeper RLM predicates:
+
+#+begin_src prolog
+rlm_query(+Query, +SubContext, +Options, -Outcome).
+rlm_completion(+Query, +Context, +Options, -Outcome).
+#+end_src
+
+There is an important current-runtime detail:
+
+=rlm_query/4= is a low-level recursive-query primitive. It registers or accepts an opaque context, but its model prompt receives the context *metadata*, not the full context bytes automatically.
+
+So do *not* assume this:
+
+#+begin_src prolog
+rlm_query(
+    "What token is present?",
+    text("The token is BLUE_17."),
+    [],
+    Outcome
+).
+#+end_src
+
+means the model automatically sees ="The token is BLUE_17."=.
+
+For your first real context-aware RLM, use the CLI command from section 7:
+
+#+begin_src sh
+swipl -q -s bin/prolog-rlm.pl -- rlm \
+  "What token is present?" \
+  --context "The token is BLUE_17."
+#+end_src
+
+That command builds the current trusted depth-1 orchestration skeleton, slices the opaque context, and executes the bounded child model call through the production runtime.
+
+When you later need application-controlled capabilities, tools, budgets, and planner behavior, learn =rlm_completion/4= in the deep tutorial.
+
+For a first Prolog program, start with =llm_query/3=.
+
+* 12. Call Prolog-RLM from your own program
+
+Create =hello_rlm.pl= in the repository root:
+
+#+begin_src prolog
+:- use_module('prolog/rlm').
+
+main :-
+    rlm_version(Version),
+    format('prolog-rlm version: ~w~n', [Version]),
+    demo_context(Result),
+    writeln(Result).
+
+:- initialization(main, main).
+#+end_src
+
+Run it:
+
+#+begin_src sh
+swipl -q -s hello_rlm.pl
+#+end_src
+
+That is a normal Prolog program importing =prolog-rlm= as a library.
+
+The important line is:
+
+#+begin_src prolog
+:- use_module('prolog/rlm').
+#+end_src
+
+The important call is just a predicate call:
+
+#+begin_src prolog
+demo_context(Result)
+#+end_src
+
+There is no special RPC layer required when your application is itself running in SWI-Prolog.
+
+* 13. Make your own real-model program
+
+Create =ask_model.pl=:
+
+#+begin_src prolog
+:- use_module('prolog/rlm').
+
+main :-
+    llm_query(
+        "Explain Prolog in one short sentence.",
+        [],
+        Outcome
+    ),
+    writeln(Outcome).
+
+:- initialization(main, main).
+#+end_src
+
+Run it with your OpenRouter key:
+
+#+begin_src sh
+export OPENROUTER_API_KEY='your-key-here'
+swipl -q -s ask_model.pl
+#+end_src
+
+You now have a Prolog application making a model call through the harness.
+
+* 14. Put an RLM call in a shell script
+
+For the easy path, your application can call the existing CLI harness instead of rebuilding its orchestration.
+
+Create =ask_context.sh=:
+
+#+begin_src sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+swipl -q -s bin/prolog-rlm.pl -- rlm \
+  "Which database does Project Alpha use?" \
+  --context "Project Alpha uses CouchDB. Project Beta uses PostgreSQL."
+#+end_src
+
+Make it executable:
+
+#+begin_src sh
+chmod +x ask_context.sh
+#+end_src
+
+Run it:
+
+#+begin_src sh
+export OPENROUTER_API_KEY='your-key-here'
+./ask_context.sh
+#+end_src
+
+This is still using the real Prolog-RLM harness. The shell script is only invoking its supported CLI entrypoint.
+
+When your surrounding application is written in Prolog and you need full programmatic RLM orchestration, move to =rlm_completion/4= rather than recreating the harness yourself.
+
+* 15. Use a local OpenAI-compatible model instead
+
+The CLI can also talk to a local OpenAI-compatible chat-completions endpoint.
+
+Example:
+
+#+begin_src sh
+swipl -q -s bin/prolog-rlm.pl -- direct "hello" \
+  --endpoint http://127.0.0.1:8000/v1/chat/completions \
+  --model local-model \
+  --no-credential
+#+end_src
+
+A custom endpoint requires an explicit model name.
+
+The same provider options can be used with the =rlm= CLI command.
+
+This means Prolog-RLM is not tied only to OpenRouter.
+
+* 16. Save a trace when something is confusing
+
+Add =--trace=:
+
+#+begin_src sh
+swipl -q -s bin/prolog-rlm.pl -- rlm \
+  "What token is in the context?" \
+  --context "The token is TRACE_ME." \
+  --trace /tmp/rlm.json
+#+end_src
+
+Then view it:
+
+#+begin_src sh
+swipl -q -s bin/prolog-rlm.pl -- trace-view /tmp/rlm.json
+#+end_src
+
+Or ask for JSON directly:
+
+#+begin_src sh
+swipl -q -s bin/prolog-rlm.pl -- demo recursion --json
+#+end_src
+
+This is often easier than staring at a giant Prolog term.
+
+* 17. The four calls to remember
+
+If you forget everything else, remember these.
+
+**Run the demo**
+
+#+begin_src sh
+swipl -q -s bin/prolog-rlm.pl -- demo
+#+end_src
+
+**Make a normal model call**
+
+#+begin_src sh
+swipl -q -s bin/prolog-rlm.pl -- direct "hello"
+#+end_src
+
+**Make an RLM call with context**
+
+#+begin_src sh
+swipl -q -s bin/prolog-rlm.pl -- rlm \
+  "What is the token?" \
+  --context "The token is ABC123."
+#+end_src
+
+**Load it as a Prolog library**
+
+#+begin_src prolog
+:- use_module('prolog/rlm').
+#+end_src
+
+Then call predicates such as:
+
+#+begin_src prolog
+llm_query(Prompt, Options, Outcome).
+rlm_query(Query, Context, Options, Outcome).
+rlm_completion(Query, Context, Options, Outcome).
+#+end_src
+
+* 18. What should I learn next?
+
+Once these commands make sense, move to the full tutorial:
+
+[[id:de17f55f-3d3b-4dcd-b99f-55e272ccdd4c][Prolog-RLM from Zero: Contexts, Typed Plans, Agents, Graphs, and Recursive LLMs]]
+
+That tutorial explains the pieces intentionally skipped here:
+
+- opaque context handles;
+- typed plan ASTs;
+- capabilities;
+- tool registration;
+- budgets;
+- recursive execution;
+- cancellation;
+- agents;
+- durable graphs;
+- artifacts;
+- adaptive recursion;
+- MCP;
+- benchmarks.
+
+For now, the mental model is enough:
+
+#+begin_example
+CLI:
+  bin/prolog-rlm.pl
+
+Library:
+  prolog/rlm.pl
+
+Normal LLM:
+  llm_query/3
+
+RLM-style subquery:
+  rlm_query/4
+
+Full RLM supervisor:
+  rlm_completion/4
+#+end_example
+
+You do not need to build a harness. You are already using it.
