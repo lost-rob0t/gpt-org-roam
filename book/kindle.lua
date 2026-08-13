@@ -21,3 +21,15 @@ function Image(element)
   end
   return element
 end
+
+function Subscript(element)
+  -- Pandoc's Org reader interprets identifier_text as a subscript. Technical
+  -- tutorials overwhelmingly mean the literal identifier. Real mathematics
+  -- should use an Org/Pandoc math node instead.
+  return pandoc.Str("_" .. pandoc.utils.stringify(element.content))
+end
+
+function Superscript(element)
+  -- Preserve caret-bearing technical text for the same reason.
+  return pandoc.Str("^" .. pandoc.utils.stringify(element.content))
+end
