@@ -1,0 +1,139 @@
+:PROPERTIES:
+:ID:       c91d5283-f96e-4d95-92f6-a926ea6951f5
+:END:
+#+title: StarLang Spec Libraries and Portable Contracts
+#+filetags: :starlang:contracts:schemas:concept:
+#+property: repo https://github.com/lost-rob0t/star-lang
+#+property: source_ref main
+
+* Core idea
+
+A StarLang spec library is a versioned unit of type, document, message, and related contract declarations. It is written in =.star= syntax and compiled by StarLang's own parser/compiler pipeline rather than by the Common Lisp reader.
+
+Minimal shape:
+
+#+begin_src lisp
+(spec-library "org.example/demo@1"
+  (:version "1.0.0")
+
+  (scalar object-id
+    (:base string
+     :pattern "^[a-z0-9-]+$"))
+
+  (enum job-status
+    (queued running completed failed))
+
+  (document job
+    (:persistence persistent)
+    (id object-id :required)
+    (status job-status :required))
+
+  (message run-job
+    (:fields
+     ((id object-id :required)))))
+#+end_src
+
+This is Lisp-shaped data, but it is not Common Lisp code.
+
+* Imports
+
+Imports are intended to be exact-versioned and digest-locked. A concrete fixture looks like:
+
+#+begin_src lisp
+(import "org.starintel/core@1"
+  :version "1.0.0"
+  :digest "sha256:core-v1-research-fixture")
+#+end_src
+
+The approved boundary requires full SHA-256 locking and HTTPS-only remote resolution when remote resolution is explicitly enabled. Treat an import as a reproducible compiler dependency, not as a dynamic package lookup.
+
+* Scalars
+
+Scalars refine primitive types with validation constraints:
+
+#+begin_src lisp
+(scalar port-number
+  (:base integer
+   :minimum 0
+   :maximum 65535))
+
+(scalar confidence-score
+  (:base decimal
+   :minimum 0
+   :maximum 1
+   :scale 4))
+#+end_src
+
+Common base types visible in current fixtures include =string=, =integer=, =decimal=, =boolean=, =symbol=, =map=, =reference=, =iso-date=, and =iso-datetime=, plus list forms such as =(list string)=.
+
+* Enums
+
+Enums define closed symbolic domains:
+
+#+begin_src lisp
+(enum tool-run-status
+  (queued running completed failed cancelled))
+#+end_src
+
+Use an enum when the accepted values are actually a protocol contract. Use a string when extension by outside producers is expected.
+
+* Documents
+
+Documents describe persistent or transient data contracts. They can extend another document and can carry ID policies.
+
+#+begin_src lisp
+(document org
+  (:extends document
+   :persistence persistent
+   :id-policy (:kind digest
+               :algorithm md5
+               :fields (name reg country)))
+  (reg string :optional)
+  (name string :required)
+  (country string :optional))
+#+end_src
+
+Field spelling matters. Serialized/document/wire names use lower camelCase and preserve source spelling. Do not casually kebab-case =schemaVersion= into =schema-version= inside a StarLang contract.
+
+* ID policies
+
+Current runtime support includes:
+
+- ULID -- time-sortable generated identifiers;
+- UUIDv4 -- random UUID identifiers;
+- digest IDs -- deterministic IDs derived from canonicalized field values.
+
+Digest identity is useful when the same logical object should collapse to the same ID regardless of input map ordering.
+
+* Messages
+
+Messages define actor/protocol payloads separately from stored documents:
+
+#+begin_src lisp
+(message run-tool
+  (:fields
+   ((programId program-id :required)
+    (runId run-id :required)
+    (tool tool-name :required)
+    (target string :required)
+    (options map :optional))))
+#+end_src
+
+This separation is important. A persistence schema and an actor command may overlap, but they are different contracts with different lifecycle semantics.
+
+* Portable output
+
+The compiler's normalized IR must remain runtime-neutral. Portable manifests and generated TypeScript/Python bindings consume contracts produced from that IR; they do not reimplement StarLang semantics.
+
+That means a correct extension usually has two questions:
+
+1. What is the language-level contract and normalized representation?
+2. Which runtime/adapter consumes it?
+
+Do not leak a concrete transport, process primitive, or CL-GServer call into the normalized contract just because the current runtime happens to use it.
+
+* Related nodes
+
+- [[id:1111004a-95fd-488b-979b-e8433431e299][StarLang]]
+- [[id:dca7bf46-7062-4e34-bfaf-8bec6e520a42][StarLang Compiler and Runtime Architecture]]
+- [[id:41d65192-9402-4597-940d-3fb304e6ebc9][StarLang from Zero: Compiler, Contracts, Documents, and Durable Actors]]
