@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  org-roam-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate Org-roam graph
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          root = Path('.')
+          org_files = sorted(root.rglob('*.org'))
+
+          if not org_files:
+              sys.exit('no Org files found')
+
+          index = root / 'index.org'
+          if not index.is_file():
+              sys.exit('index.org is missing')
+
+          id_re = re.compile(r'^:ID:\s+([^\s]+)\s*$', re.MULTILINE)
+          link_re = re.compile(r'\[\[id:([^\]]+)\]')
+          title_re = re.compile(r'^#\+title:\s+.+$', re.MULTILINE | re.IGNORECASE)
+
+          ids = {}
+          contents = {}
+
+          for path in org_files:
+              try:
+                  text = path.read_text(encoding='utf-8')
+              except UnicodeDecodeError as exc:
+                  sys.exit(f'{path}: not valid UTF-8: {exc}')
+
+              if not text.strip():
+                  sys.exit(f'{path}: empty Org document')
+
+              contents[path] = text
+
+              for value in id_re.findall(text):
+                  if value in ids:
+                      sys.exit(f'duplicate Org-roam ID {value}: {ids[value]} and {path}')
+                  ids[value] = path
+
+              if path.parts and path.parts[0] == 'tutorials' and not title_re.search(text):
+                  sys.exit(f'{path}: tutorial is missing #+title')
+
+          for path, text in contents.items():
+              for target in link_re.findall(text):
+                  if target not in ids:
+                      sys.exit(f'{path}: unresolved Org-roam id link {target}')
+
+          print(f'validated {len(org_files)} Org files and {len(ids)} unique Org-roam IDs')
+          PY
