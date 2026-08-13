@@ -1,0 +1,100 @@
+name: Kindle EPUBs
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - 'books-v*'
+  workflow_dispatch:
+
+concurrency:
+  group: kindle-epubs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and validate tutorial books
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install EPUB toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            pandoc \
+            epubcheck \
+            python3-pil \
+            fonts-dejavu-core
+
+      - name: Build one EPUB per tutorial
+        run: python3 scripts/build_epubs.py --output dist
+
+      - name: Validate EPUB 3 packages
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          epubs=(dist/*.epub)
+          if (( ${#epubs[@]} == 0 )); then
+            echo 'No EPUB files were generated.' >&2
+            exit 1
+          fi
+          for epub in "${epubs[@]}"; do
+            echo "==> epubcheck ${epub}"
+            epubcheck "${epub}"
+          done
+
+      - name: Write checksums
+        run: |
+          cd dist
+          sha256sum -- *.epub > SHA256SUMS
+
+      - name: Upload Kindle EPUB bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: kindle-epubs
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  release:
+    name: Publish versioned tutorial books
+    if: startsWith(github.ref, 'refs/tags/books-v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download validated books
+        uses: actions/download-artifact@v4
+        with:
+          name: kindle-epubs
+          path: dist
+
+      - name: Publish GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release create "${TAG}" \
+              --title "Tutorial EPUBs ${TAG}" \
+              --notes "Kindle-friendly EPUBs generated from every tutorials/*.org file. Each tutorial is a standalone reflowable book with a generated cover, embedded local images, readable code blocks, a navigation TOC, and EPUBCheck validation."
+          fi
+
+          assets=(dist/*.epub dist/SHA256SUMS dist/manifest.json dist/covers/*.jpg)
+          gh release upload "${TAG}" "${assets[@]}" --clobber
