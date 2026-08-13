@@ -8,106 +8,96 @@
 
 * Goal
 
-This tutorial is for learning =prolog-rlm= well enough to run it, debug it, extend it, and build bounded agentic RLM systems on top of it.
+This is a code-first tutorial for learning =prolog-rlm= well enough to run it, debug it, extend it, and build bounded agentic RLM systems on top of it.
 
-It is based on the implementation, tests, and current documentation in the repository rather than on a generic description of Recursive Language Models.
+It was written from the current =main= implementation, tests, and runtime documentation. It is deliberately not a generic “what is an RLM?” article.
 
 By the end you should be able to:
 
-- explain what =prolog-rlm= means by an RLM;
-- explain why Prolog owns execution semantics while the model chooses semantic strategy;
-- run the repository's deterministic test and conformance suites;
-- register and inspect opaque external contexts;
-- use bounded =peek=, =slice=, =search=, =partition=, =map=, and =reduce= operations;
+- explain why =prolog-rlm= keeps large context behind opaque handles;
+- trace a root RLM call from model planner to typed plan to validated execution;
 - configure OpenRouter or another OpenAI-compatible provider;
-- understand and execute the closed typed-plan AST;
-- define capability-gated tools without exposing arbitrary =call/1= to model output;
+- execute typed plans without an LLM first;
+- register capability-gated tools without exposing arbitrary =call/1=;
 - distinguish =llm_query/3=, =rlm_query/4=, and =rlm_completion/4=;
-- understand recursive depth, capability narrowing, cost, token, tool, context, time, and output budgets;
-- use structured outcomes, inspection, and bounded plan repair;
-- create supervised logical agents with bounded mailboxes and worker pools;
-- compile and run durable state graphs with checkpoints, interrupts, and resume;
-- publish durable artifacts and rebuild bounded fresh-root context from them;
-- understand adaptive recursion routing instead of treating recursion as the default;
-- understand the version-neutral MCP boundary;
+- reason about recursion, capability narrowing, cancellation, cost, token, tool, context, output, and wall-time budgets;
+- use structured outcomes, bounded inspection, and plan repair;
+- create supervised logical agents with finite mailboxes and bounded worker pools;
+- compile and run durable state graphs with interrupts and resume;
+- persist selected artifacts without treating transcripts as memory;
+- understand adaptive recursion routing and its duplicate/no-progress guards;
+- understand the canonical MCP boundary;
 - run deterministic and live benchmark modes;
-- complete a practical repository-analysis RLM project.
+- build a bounded repository-analysis RLM as a capstone.
 
 * 1. What prolog-rlm actually is
 
-The short version is:
+The repository describes itself as a Prolog-native language-model harness and agent runtime built around Recursive Language Models.
 
-#+begin_quote
-=prolog-rlm= is a SWI-Prolog-native language-model harness and agent runtime where the model may choose strategy, but Prolog validates and owns execution.
-#+end_quote
-
-That distinction is the project.
-
-An ordinary LLM application often looks roughly like this:
-
-#+begin_example
-huge prompt
-  -> model
-  -> text answer
-#+end_example
-
-An RLM-style application treats the external context as something the model can *operate on* without stuffing all of it into a single prompt:
-
-#+begin_example
-query + external context
-        |
-        v
-opaque context handle
-        |
-        v
-model selects bounded strategy
-        |
-        v
-typed symbolic plan
-        |
-        v
-Prolog validates capabilities + budgets
-        |
-        v
-context / model / tool / recursive / agent operations
-        |
-        v
-structured trajectory + result
-#+end_example
-
-The model is not handed unrestricted Prolog execution. It does not get arbitrary =call/1=, =shell/1=, =consult/1=, filesystem access, or network access just because it emitted text that looks executable.
-
-The central design rule is:
+The central architectural rule is:
 
 #+begin_quote
 The language model chooses semantic strategy; Prolog owns execution semantics.
 #+end_quote
 
-* 2. Current status: trust code and tests over the stale backlog
+That means the LLM can propose decomposition, context operations, model calls, tool calls, recursive work, and agent work. It does *not* receive unrestricted Prolog execution.
 
-The public runtime reports:
+The control shape is roughly:
+
+#+begin_example
+query + external context
+          |
+          v
+  opaque context handle
+          |
+          v
+   root planner model
+          |
+          v
+   typed symbolic plan
+          |
+          v
+Prolog parse + validation
+          |
+          +--> capability check
+          +--> budget check
+          +--> provider/tool preflight
+          +--> recursion guard
+          |
+          v
+ bounded execution + trace
+          |
+          v
+ structured outcome
+#+end_example
+
+This is not “let the model generate Prolog and =call/1= it.” The plan language is closed and model text is treated as data.
+
+* 2. Repository status: code and tests beat the stale TODO
+
+The public runtime currently reports:
 
 #+begin_src prolog
 rlm_version('0.1.0-dev').
 #+end_src
 
-The SWI pack metadata reports version =0.1.0=.
+The SWI pack metadata reports =0.1.0=.
 
-One important repository-reading rule: =TODO.md= is currently behind the implementation. It still contains many unchecked items for systems that already have production modules, tests, and documentation.
+One repo-reading warning: =TODO.md= still has many unchecked items whose modules, tests, and docs already exist.
 
-When learning the current implementation, use this authority order:
+For current behavior, use this authority order:
 
 1. =prolog/*.pl= implementation;
 2. =test/*.pl= executable behavior;
-3. =docs/*.md= architectural contract;
+3. =docs/*.md= architecture and contracts;
 4. =README.md= orientation;
-5. =TODO.md= backlog/history, not a reliable implementation-status ledger.
+5. =TODO.md= backlog/history.
 
-Do not conclude that a feature is absent merely because its checkbox is still open.
+Do not decide something is unimplemented just because the checkbox is open.
 
-* 3. Get the repository running
+* 3. Get it running
 
-The baseline is SWI-Prolog 9.0 or newer.
+The documented baseline is SWI-Prolog 9.0 or newer.
 
 #+begin_src sh
 git clone https://github.com/lost-rob0t/prolog-rlm
@@ -115,20 +105,18 @@ cd prolog-rlm
 swipl --version
 #+end_src
 
-Check the runtime/module graph:
+Check runtime loading:
 
 #+begin_src sh
 swipl -q -s test/check_runtime.pl
 swipl -q -s test/load_all.pl
 #+end_src
 
-Run the deterministic suite:
+Run deterministic tests:
 
 #+begin_src sh
 swipl -q -s test/run_tests.pl
 #+end_src
-
-The test runner covers chain/provider behavior, streaming, MCP, contexts, plans, tools, completion, hardening, outcomes, artifacts, agents, graphs, adaptive recursion, benchmarks, and conformance.
 
 The production entrypoint is:
 
@@ -136,80 +124,78 @@ The production entrypoint is:
 :- use_module('prolog/rlm').
 #+end_src
 
-At the REPL:
+Try the public readiness contract:
 
 #+begin_src prolog
 ?- use_module('prolog/rlm').
 true.
 
-?- rlm_version(Version).
-Version = '0.1.0-dev'.
+?- rlm_version(V).
+V = '0.1.0-dev'.
 
 ?- rlm_ready.
 true.
 #+end_src
 
-There is currently no repository =flake.nix=. Do not invent Nix commands for this project unless a Nix layer is added later.
+There is no =flake.nix= in the current repository, so this tutorial does not invent Nix commands for it.
 
-* 4. The module map
+* 4. Module map
 
-The top-level =rlm= module is a public facade, but lower-level developer APIs live in their own modules.
+The public facade is =prolog/rlm.pl=. Developer-level subsystems live beside it.
 
 Important modules:
 
-- =prolog/rlm.pl= -- public runtime facade;
-- =prolog/rlm_chain.pl= -- provider-neutral model access;
-- =prolog/rlm_context.pl= -- opaque external context handles;
-- =prolog/rlm_plan.pl= -- closed typed symbolic plan parser/validator/executor;
-- =prolog/rlm_tool.pl= -- capability-gated trusted tool registry;
-- =prolog/rlm_completion.pl= -- bounded root RLM supervisor;
-- =prolog/rlm_outcome.pl= -- structured outcomes, inspection, repair;
-- =prolog/rlm_agent.pl= -- supervised logical agents;
-- =prolog/rlm_graph.pl= -- validated durable state graphs;
-- =prolog/rlm_artifact.pl= -- durable versioned artifacts;
-- =prolog/rlm_recursion_policy.pl= -- adaptive route selection;
-- =prolog/rlm_recursion_runtime.pl= -- execution of selected recursion routes;
-- =prolog/rlm_mcp.pl= -- canonical MCP facade;
-- =prolog/rlm_benchmark.pl= -- evaluation/reporting primitives.
+- =rlm.pl= -- public facade and readiness contract;
+- =rlm_chain.pl= -- model/provider abstraction;
+- =rlm_context.pl= -- opaque bounded context store;
+- =rlm_plan.pl= -- closed symbolic plan parser/validator/executor;
+- =rlm_tool.pl= -- trusted capability-gated tool registry;
+- =rlm_completion.pl= -- root RLM supervisor;
+- =rlm_outcome.pl= -- classification, inspection, bounded repair;
+- =rlm_agent.pl= -- supervised logical agents;
+- =rlm_graph.pl= -- validated durable state graphs;
+- =rlm_artifact.pl= -- versioned durable artifacts;
+- =rlm_recursion_policy.pl= -- adaptive route choice;
+- =rlm_recursion_runtime.pl= -- explicit route execution;
+- =rlm_mcp.pl= -- protocol-neutral MCP facade;
+- =rlm_benchmark.pl= -- benchmark/report primitives.
 
-A useful dependency picture is:
+Keep this rough dependency picture in mind:
 
 #+begin_example
-                       rlm
-                        |
-       +----------------+----------------+
-       |                |                |
-   completion          agent            graph
-       |                |                |
-  +----+-----+          |           persistence
-  |    |     |          |
-chain context plan -----+
-       |     |
-       |    tool
-       |
- providers
+                    rlm
+                     |
+        +------------+-------------+
+        |            |             |
+   completion      agent          graph
+        |            |             |
+   +----+----+       |        persistence
+   |    |    |       |
+ chain context plan--+
+            |
+           tool
 
-artifacts <---- agents / graphs / fresh roots
-recursion policy ----> explicit route handlers
-MCP ----> canonical tool/resource/prompt boundary
+ artifacts <---- agents / graphs / later roots
+ recursion policy ----> explicit route handlers
+ MCP ------------> canonical tools/resources/prompts
 #+end_example
 
-* 5. Opaque contexts are the first RLM primitive
+* 5. Opaque context: the first RLM primitive
 
-Import the context runtime directly:
+Import the lower-level context module when experimenting directly:
 
 #+begin_src prolog
 :- use_module('prolog/rlm_context').
 #+end_src
 
-The memory backend accepts only explicit text or term sources:
+The memory backend accepts explicit text or term payloads:
 
 #+begin_src prolog
 context_register(text(Text), Options, Outcome).
 context_register(terms(Terms), Options, Outcome).
 #+end_src
 
-Try it:
+Example:
 
 #+begin_src prolog
 ?- context_register(
@@ -219,85 +205,57 @@ Try it:
    get_dict(handle, Ref, Handle).
 #+end_src
 
-The result contains a versioned opaque handle and metadata. It does *not* hand the external payload to every later model call.
+The result contains an opaque versioned handle plus metadata. The payload does not automatically become part of every model prompt.
 
-The initial memory backend advertises no implicit filesystem or network authority. A value such as =file('/etc/passwd')= is not silently dereferenced as context.
+The memory backend advertises =filesystem:false= and =network:false=. Passing =file(Path)= or =url(URL)= does not cause ambient dereferencing.
 
-Default projection bounds are roughly:
+The documented default operation bounds are:
 
 #+begin_src prolog
 [max_results(32), max_bytes(16384), time_limit(0.25)]
 #+end_src
 
-These are part of the execution model, not decoration.
+* 6. Learn context operations without an LLM
 
-* 6. Context operations
-
-Given =Handle= from the previous section:
-
-**Peek**
+With =Handle= from the previous section:
 
 #+begin_src prolog
-?- context_peek(Handle, head(12), [], Outcome).
+?- context_peek(Handle, head(12), [], Peek).
+?- context_slice(Handle, 6, 20, [], Slice).
+?- context_search(Handle, "needle", [], Search).
+?- context_partition(Handle, lines(2), [], Parts).
+?- context_map(Handle, lowercase, [], Lower).
+?- context_reduce(Handle, count, [], Count).
+?- context_trace(Handle, 20, Trace).
 #+end_src
 
-**Slice**
+The important part is not the syntax. It is the *closed vocabulary*.
 
-#+begin_src prolog
-?- context_slice(Handle, 6, 20, [], Outcome).
-#+end_src
+Current map transforms include things like:
 
-Text indexes are character based. Term-context slices are item based.
+- =identity=;
+- =lowercase=;
+- =uppercase=;
+- =length=.
 
-**Search**
+Reducers include:
 
-#+begin_src prolog
-?- context_search(Handle, "needle", [], Outcome).
-#+end_src
+- =count=;
+- =byte_count=.
 
-Text search is line based. Term search uses a stable textual representation.
+The model cannot smuggle an arbitrary Prolog predicate into =context_map/4=.
 
-**Partition**
+**Exercise:** register =terms([person(alice), person(bob), relation(alice,bob)])=. Compare term =peek=, =slice=, =search=, =map(length)=, and =reduce(count)=.
 
-#+begin_src prolog
-?- context_partition(Handle, lines(2), [], Outcome).
-#+end_src
+* 7. Typed plans are the execution boundary
 
-**Allow-listed map**
-
-#+begin_src prolog
-?- context_map(Handle, lowercase, [], Outcome).
-#+end_src
-
-The current transform vocabulary includes =identity=, =lowercase=, =uppercase=, and =length=.
-
-**Allow-listed reduce**
-
-#+begin_src prolog
-?- context_reduce(Handle, count, [], Outcome).
-#+end_src
-
-Reducers include =count= and =byte_count=.
-
-**Trace**
-
-#+begin_src prolog
-?- context_trace(Handle, 20, Outcome).
-#+end_src
-
-The important security property is that =map= and =reduce= do not accept arbitrary caller/model predicates. They select from a closed vocabulary.
-
-**Exercise:** register a =terms([...])= context containing small Prolog facts as data. Compare =peek(item(N))=, =slice=, =search=, =map(length)=, and =reduce(count)=.
-
-* 7. Typed plans: model strategy becomes closed data
-
-Import the plan layer directly when working below =rlm_completion/4=:
+Import the plan runtime:
 
 #+begin_src prolog
 :- use_module('prolog/rlm_plan').
 #+end_src
 
-The main flow is:
+The public flow is:
 
 #+begin_src prolog
 plan_parse(+ModelOutput, -Outcome).
@@ -307,7 +265,7 @@ plan_execute(+ValidatedPlan, +RuntimeOptions, +Inputs, -Outcome).
 plan_run(+PlanLike, +Capabilities, +RuntimeOptions, +Inputs, -Outcome).
 #+end_src
 
-The closed AST currently contains:
+The closed AST includes:
 
 #+begin_src prolog
 context(HandleExpr, Action, Bind).
@@ -320,7 +278,7 @@ checkpoint(Label).
 final(ValueExpr).
 #+end_src
 
-Expressions are also closed:
+Closed expressions include:
 
 #+begin_src prolog
 literal(Value).
@@ -331,43 +289,41 @@ list(Exprs).
 object(KeyExprPairs).
 #+end_src
 
-That means a model can say “call tool =project_read=” or “search this context,” but it cannot supply a new Prolog closure to execute.
+JSON planner output is decoded as JSON. The runtime does not fall back to reading arbitrary model-produced Prolog source as the control path.
 
-* 8. Execute a model-free context plan first
+* 8. Execute a plan before involving a model
 
-Before involving an LLM, prove that you understand the plan runtime itself.
+This is the fastest way to separate plan bugs from planner bugs.
 
-Assume =Handle= is an existing context handle:
+Assume =Handle= is a registered context handle:
 
 #+begin_src prolog
 Plan = plan([
     context(input(context), search("needle"), hits),
     final(var(hits))
 ]),
-Capabilities = [context(search)],
+Caps = [context(search)],
 Inputs = _{context:Handle},
-plan_run(Plan, Capabilities, [], Inputs, Outcome).
+plan_run(Plan, Caps, [], Inputs, Outcome).
 #+end_src
 
-Why this matters: if this fails, you have a plan/context problem, not an LLM problem.
+Whole-plan validation checks things such as:
 
-Whole-plan validation occurs before execution. The runtime checks at least:
+- every operation belongs to the closed vocabulary;
+- =final/1= appears once and last;
+- variables are bound before use;
+- bindings are not reused;
+- context selectors/actions are allowed;
+- requested capabilities are granted;
+- nested recursion/retry/parallel plans are valid;
+- worst-case static counts fit the plan budget;
+- named providers and tools can be preflighted before the first side effect.
 
-- operation vocabulary;
-- exactly one final step, at the end;
-- use-before-bind;
-- duplicate bindings;
-- allow-listed context actions;
-- capabilities;
-- nested recursion/retry/parallel structure;
-- worst-case budget estimates;
-- provider/tool preflight.
+A plan rejected during validation should not half-execute.
 
-A validation failure should produce no earlier partial tool/model/context side effects.
+* 9. Capabilities are authority, not labels
 
-* 9. Capabilities are explicit authority
-
-Capabilities look like ordinary Prolog terms:
+Capabilities are ordinary closed terms:
 
 #+begin_src prolog
 context(search).
@@ -384,20 +340,21 @@ process(exec).
 mcp(tools).
 #+end_src
 
-The existence of a capability term does not grant it. It must appear in the active capability set.
+A model naming =project_read= does not grant =tool(project_read)=.
 
-Children narrow authority:
+Child capabilities are narrowing-only:
 
 #+begin_src prolog
+?- use_module('prolog/rlm_tool').
 ?- capabilities_narrow(
        [rlm, model(openrouter), tool(project_read)],
        [model(openrouter)],
        Outcome).
 #+end_src
 
-This is valid.
+That succeeds.
 
-Trying to give the child something the parent lacks fails closed:
+This must fail:
 
 #+begin_src prolog
 ?- capabilities_narrow(
@@ -406,28 +363,22 @@ Trying to give the child something the parent lacks fails closed:
        Outcome).
 #+end_src
 
-The second request is capability widening and is rejected.
+A child may drop authority, not invent it.
 
 * 10. Trusted tools
 
-Import the registry:
-
-#+begin_src prolog
-:- use_module('prolog/rlm_tool').
-#+end_src
-
-The lifecycle is:
+The host creates a registry, supplies schemas, and supplies trusted handlers:
 
 #+begin_src prolog
 tool_registry_create(Registry).
-tool_register(Registry, Schema, TrustedHandler, Outcome).
+tool_register(Registry, Schema, Handler, Outcome).
 tool_discover(Registry, Schemas).
 tool_lookup(Registry, Name, Outcome).
-tool_invoke(Registry, Capabilities, Name, Args, Options, Outcome, Trace).
+tool_invoke(Registry, Caps, Name, Args, Options, Outcome, Trace).
 tool_registry_destroy(Registry).
 #+end_src
 
-A minimal custom tool can look like:
+A small custom tool:
 
 #+begin_src prolog
 count_text(Args, Count) :-
@@ -453,7 +404,7 @@ count_text_schema(
     }).
 #+end_src
 
-Register and call it:
+Use it:
 
 #+begin_src prolog
 tool_registry_create(Registry),
@@ -469,11 +420,11 @@ tool_invoke(
     Trace).
 #+end_src
 
-The handler is trusted host configuration. The model may select =count_text= by name, but never receives the closure =user:count_text=.
+Authorization occurs before handler execution. Args and results are schema checked. Wall time and output bytes are bounded. The model can select the registered *name* but never supplies =user:count_text=.
 
-* 11. The built-in project_read tool
+* 11. The built-in project_read boundary
 
-The first real local tool is deliberately narrow:
+The first real local tool is intentionally narrow:
 
 #+begin_src prolog
 register_project_read_tool(
@@ -489,11 +440,11 @@ It requires:
 tool(project_read)
 #+end_src
 
-It reads one regular UTF-8 file under an explicitly configured root.
+It reads one regular UTF-8 file below the configured root. Absolute paths, traversal, backslash paths, NUL paths, and symlink components are rejected.
 
-It rejects absolute paths, =.= / =..= traversal, backslash paths, NUL-containing paths, and symlink components. Registering it does not magically grant general filesystem, process, shell, or network access.
+Registering it does not grant general =filesystem(read)=, shell, process, or network authority.
 
-To expose registry tools to a typed plan:
+Typed-plan integration:
 
 #+begin_src prolog
 Caps = [tool(project_read)],
@@ -506,34 +457,34 @@ plan_run(
     Outcome).
 #+end_src
 
-Notice the double check:
+Notice the two boundaries:
 
-1. the plan must validate against =tool(project_read)=;
-2. registry invocation independently authorizes the same capability.
+1. plan validation requires =tool(project_read)=;
+2. the registry rechecks authorization when invoking the handler.
 
 * 12. Model providers
 
-The chain layer is provider neutral:
+Import the provider layer directly when testing it:
 
 #+begin_src prolog
 :- use_module('prolog/rlm_chain').
 #+end_src
 
-OpenRouter configuration:
+OpenRouter:
 
 #+begin_src prolog
-?- openrouter_provider('openrouter/free', Provider).
+openrouter_provider('openrouter/free', Provider).
 #+end_src
 
-The provider term stores =credential(env('OPENROUTER_API_KEY'))= rather than the resolved secret.
+The provider stores =credential(env('OPENROUTER_API_KEY'))= rather than the resolved secret.
 
-Set the credential in the environment before running a live call:
+Set the key before a live request:
 
 #+begin_src sh
 export OPENROUTER_API_KEY='...'
 #+end_src
 
-A direct model request:
+Minimal request:
 
 #+begin_src prolog
 openrouter_provider('openrouter/free', Provider),
@@ -544,7 +495,7 @@ Request = model_request{
 model_complete(Provider, Request, Outcome).
 #+end_src
 
-For another compatible endpoint:
+Other OpenAI-compatible endpoints use:
 
 #+begin_src prolog
 openai_compatible_provider(
@@ -554,58 +505,51 @@ openai_compatible_provider(
     Provider).
 #+end_src
 
-For a local endpoint requiring no credential, use =none= instead of a raw secret.
+Use =none= for a local compatible endpoint requiring no credential. Do not inject raw resolved keys into provider terms.
 
-* 13. llm_query/3 vs rlm_query/4 vs rlm_completion/4
+* 13. llm_query, rlm_query, and rlm_completion are different layers
 
-These are different levels of abstraction.
+The public facade exports all three.
 
-**=llm_query/3=**
-
-One bounded model call:
+**Direct bounded model call**
 
 #+begin_src prolog
-?- use_module('prolog/rlm').
-?- llm_query(
-       "Reply with the atom ok.",
-       [budget(_{max_total_tokens:256, max_cost_usd:0.05})],
-       Outcome).
+llm_query(
+    "Reply with OK.",
+    [budget(_{max_total_tokens:256, max_cost_usd:0.05})],
+    Outcome).
 #+end_src
 
-Unless a provider is supplied explicitly, completion code builds the default OpenRouter provider.
-
-**=rlm_query/4=**
-
-A bounded recursive child model query over a supplied sub-context:
+**Bounded recursive child query**
 
 #+begin_src prolog
-?- rlm_query(
-       "Summarize the child context.",
-       text("small child context"),
-       [depth(1), budget(_{max_recursion_depth:1})],
-       Outcome).
+rlm_query(
+    "Summarize the child context.",
+    text("child context"),
+    [depth(1), budget(_{max_recursion_depth:1})],
+    Outcome).
 #+end_src
 
-**=rlm_completion/4=**
-
-The full root supervisor:
+**Full root RLM supervisor**
 
 #+begin_example
-root query
-  -> context registration/handle
-  -> root planner model
-  -> JSON typed plan
-  -> parse + validate
-  -> execute context/model/tool/rlm operations
-  -> enforce total budgets
-  -> structured result + trajectory
+rlm_completion/4
+   |
+   +--> acquire/register opaque context
+   +--> build root planner prompt
+   +--> call planner provider
+   +--> parse typed plan
+   +--> recursive/capability validation
+   +--> execute plan
+   +--> aggregate usage + transitions
+   +--> structured result
 #+end_example
 
-Do not use =rlm_completion/4= when you only need a direct provider call. Do not use =llm_query/3= when the task specifically needs model-selected context decomposition.
+Do not invoke the full root planner when one direct model call is enough.
 
-* 14. Root completion defaults
+* 14. Completion budgets are shared control state
 
-The current default completion budget is approximately:
+The current default completion budget is:
 
 #+begin_src prolog
 completion_budget{
@@ -622,32 +566,34 @@ completion_budget{
 }.
 #+end_src
 
-Default root capabilities are roughly:
+Default root authority is:
 
 #+begin_src prolog
 [rlm, model(openrouter)]
 #+end_src
 
-Default child capabilities narrow to:
+Default child authority narrows to:
 
 #+begin_src prolog
 [model(openrouter)]
 #+end_src
 
-So if you want a root plan to search context or call a local tool, grant those capabilities explicitly.
+A root planner call consumes model budget too. Nested plans, retries, recursive calls, tool calls, context operations, and intermediate output do not get magically fresh budgets.
+
+This is one of the most important things to understand when debugging “why did my RLM stop early?”
 
 * 15. A real agentic RLM shape
 
-The repository's live completion test proves the important production path:
+The repository's live OpenRouter acceptance test exercises the actual production path:
 
-1. a real OpenRouter root planner is called;
-2. it emits JSON for a typed plan;
-3. the plan slices an opaque context;
-4. it calls the registered =project_read= tool;
-5. it performs exactly one depth-1 recursive child model call;
-6. the runtime verifies tool authorization, recursion depth, HTTP success, model-call count, and ordered plan transitions.
+1. real OpenRouter root planner;
+2. JSON typed plan;
+3. opaque context slice;
+4. registered =project_read= tool;
+5. exactly one depth-1 recursive child model call;
+6. validation of authorization, HTTP success, recursion depth, usage, and transitions.
 
-A tutorial-scale setup begins like this:
+A small equivalent setup:
 
 #+begin_src prolog
 :- use_module('prolog/rlm').
@@ -666,7 +612,7 @@ run_demo(Outcome) :-
 
 run_demo_with_registry(Registry, Outcome) :-
     Context = text(
-        "You are a recursive child. Read only the selected context and answer briefly."),
+        "The child should answer from only the selected bounded context."),
     Options = [
         capabilities([
             rlm,
@@ -699,9 +645,9 @@ run_demo_with_registry(Registry, Outcome) :-
         Outcome).
 #+end_src
 
-For reproducible acceptance behavior, add a =planner_instruction(...)= that constrains the planner to an exact plan shape, like =test/live_completion_openrouter_test.pl= does.
+For deterministic acceptance, add a strict =planner_instruction(...)= describing the allowed plan shape. See =test/live_completion_openrouter_test.pl= for the real pattern.
 
-* 16. Cancellation is a control signal
+* 16. Cancellation is a first-class control signal
 
 Create a token:
 
@@ -709,25 +655,25 @@ Create a token:
 rlm_cancellation_token(Token).
 #+end_src
 
-Pass it to a completion:
+Pass it:
 
 #+begin_src prolog
 [cancel_token(Token)]
 #+end_src
 
-Cancel from another control path:
+Cancel it from another control path:
 
 #+begin_src prolog
 rlm_cancel(Token).
 #+end_src
 
-The implementation actively signals the thread running the completion. Cancellation and time-limit signals are intentionally preserved as control signals instead of being swallowed and misclassified as ordinary tool/model errors.
+The implementation actively signals the thread running the completion. Cancellation and time-limit exceptions remain control signals instead of being swallowed as ordinary model/tool failures.
 
-The deterministic suite includes both pre-planner cancellation and cancellation of a pending model call.
+The deterministic tests cover both pre-planner cancellation and cancellation while a model call is pending.
 
-* 17. Structured outcomes: Prolog failure is not one generic error
+* 17. Structured outcomes and bounded repair
 
-The outcome layer uses canonical statuses including:
+The outcome layer distinguishes:
 
 - =success=;
 - =logical_failure=;
@@ -738,31 +684,27 @@ The outcome layer uses canonical statuses including:
 - =validation_failure=;
 - =exception=.
 
-This is extremely Prolog-ish in the good way: logical failure should not be flattened into an exception.
+That matters in Prolog: logical failure is not the same thing as an exception.
 
-Inspect a plan without executing it:
+Inspect a plan without running it:
 
 #+begin_src prolog
 plan_inspect(Plan, Capabilities, Budget, Inspection).
 #+end_src
 
-Inspect a trusted predicate's metadata:
+Inspect predicate metadata:
 
 #+begin_src prolog
 predicate_inspect(my_module:worker(_), Inspection).
 #+end_src
 
-Wrap trusted goals:
+Wrap a trusted host goal:
 
 #+begin_src prolog
 goal_outcome(member(X, [a,b]), [], Outcome).
 #+end_src
 
-The goal outcome preserves residual constraints from =copy_term/3= instead of silently discarding attributed-variable state.
-
-* 18. Bounded plan repair
-
-Repair is explicit and budget preserving:
+Repair API:
 
 #+begin_src prolog
 plan_repair(
@@ -774,34 +716,21 @@ plan_repair(
     Outcome).
 #+end_src
 
-The repair handler receives structured observations, not scraped stderr:
+The repair handler receives a structured observation containing phase, status, error, bounded trace, and remaining budget.
 
-#+begin_src prolog
-repair_observation{
-    attempt:Attempt,
-    status:Status,
-    phase:Phase,
-    error:StructuredError,
-    trace:BoundedTrace,
-    budget_remaining:Remaining
-}.
-#+end_src
-
-The crucial invariant:
+The critical invariant is:
 
 #+begin_quote
-Repair does not reset the execution budget.
+Repair does not reset consumed execution budget.
 #+end_quote
 
-If the first attempt consumed tool calls, steps, output bytes, or wall time, the repaired attempt receives what remains.
+A validation failure may be repaired before consuming execution counters. A tool/model/runtime failure has already spent some budget.
 
-**Exercise:** write a deterministic repair handler that replaces an invalid unknown tool with a known safe tool. Verify that a validation failure can be repaired without consuming execution counters, then compare that with an execution-time failure.
+* 18. Supervised logical agents
 
-* 19. Supervised logical agents
+The agent runtime uses SWI engines/state machines, finite message queues, and one bounded worker pool per runtime.
 
-The agent runtime uses SWI engines/state machines, finite message queues, and a shared bounded worker pool.
-
-It deliberately does not allocate one permanent OS thread per logical agent.
+It explicitly avoids one permanently blocked OS thread per logical agent.
 
 Public lifecycle:
 
@@ -818,7 +747,7 @@ agent_cancel(+Runtime, +Agent, +Reason, -Outcome).
 agent_trace(+Runtime, -Events).
 #+end_src
 
-A minimal supervision tree:
+Minimal supervision tree:
 
 #+begin_src prolog
 run_agents :-
@@ -849,11 +778,11 @@ run_agents :-
         agent_runtime_destroy(Runtime)).
 #+end_src
 
-The child cannot add authority the root does not possess.
+The child cannot request a capability absent from the parent.
 
-* 20. Mailboxes and backpressure
+* 19. Mailboxes, worker pools, and agent plan integration
 
-The message vocabulary is closed around terms such as:
+The mailbox protocol uses a closed vocabulary around terms such as:
 
 #+begin_src prolog
 request(RunId, CallId, Work).
@@ -864,11 +793,9 @@ checkpoint(RunId, Label).
 budget_exhausted(RunId, Kind).
 #+end_src
 
-Mailboxes are finite.
+Mailboxes are finite, so saturation becomes an explicit backpressure outcome rather than unbounded memory growth.
 
-That means saturation becomes a visible =mailbox_full= outcome instead of uncontrolled heap growth.
-
-Blocking trusted work is moved through a bounded thread pool configured with options such as:
+Blocking host work goes through a bounded pool configured with things like:
 
 #+begin_src prolog
 worker_count(2).
@@ -876,11 +803,7 @@ worker_backlog(8).
 worker_handler(my_module:worker_handler).
 #+end_src
 
-This gives you many logical agents with a hard ceiling on simultaneous blocking host operations.
-
-* 21. spawn_agent inside a typed plan
-
-The plan form:
+The typed-plan =spawn_agent= form is sugar over the normal tool boundary:
 
 #+begin_src prolog
 plan([
@@ -889,19 +812,7 @@ plan([
 ]).
 #+end_src
 
-is syntax sugar. It normalizes to the existing trusted tool boundary:
-
-#+begin_src prolog
-tool(
-    spawn_agent,
-    literal(agent_spawn_request{
-        spec:Spec,
-        capabilities:Capabilities
-    }),
-    Bind).
-#+end_src
-
-The host registers the trusted adapter:
+It normalizes to a =tool(spawn_agent,...)= operation. The host supplies the trusted adapter:
 
 #+begin_src prolog
 [tools([
@@ -910,52 +821,51 @@ The host registers the trusted adapter:
 ])]
 #+end_src
 
-There is no second unsafe “agent evaluator.” Agent creation still consumes normal plan/tool budgets and still requires =tool(spawn_agent)=.
+So spawning still requires =tool(spawn_agent)=, consumes normal plan/tool budget, and does not introduce a second unsafe evaluator.
 
-* 22. Durable state graphs
+* 20. Durable state graphs
 
-The graph runtime separates declarative graph data from trusted executable closures.
+Graphs are declarative data. Trusted handlers and routers live in a separate host registry.
 
-A tiny graph:
-
-#+begin_src prolog
-graph(
-    counter,
-    [field(count, integer, 0, sum)],
-    [node(increment, increment_handler)],
-    [edge(start, increment),
-     edge(increment, end)]
-).
-#+end_src
-
-Trusted host registry:
-
-#+begin_src prolog
-Registry = [
-    handler(increment_handler, my_graph:increment)
-].
-#+end_src
-
-Handler shape:
+A complete tiny graph example:
 
 #+begin_src prolog
 increment(_State, _Context, update(_{count:1})).
+
+run_graph(Outcome) :-
+    Spec = graph(
+        counter,
+        [field(count, integer, 0, sum)],
+        [node(increment, increment_handler)],
+        [edge(start, increment),
+         edge(increment, end)]
+    ),
+    Registry = [
+        handler(increment_handler, user:increment)
+    ],
+    graph_compile(Spec, Registry, [], ok(Compiled)),
+    graph_run(Compiled, _{}, [], Outcome).
 #+end_src
 
-Compile before running:
+Graph compilation validates before execution:
 
-#+begin_src prolog
-graph_compile(Spec, Registry, [], ok(Compiled)),
-graph_run(Compiled, _{}, [], Outcome).
-#+end_src
+- unique state fields;
+- unique node names;
+- reserved =start=/=end= rules;
+- exactly one edge leaving =start=;
+- no outgoing edge from =end=;
+- registered handler/router references;
+- edge targets;
+- reachability;
+- structural path to =end=.
 
-Compilation checks graph structure before side effects: unique state fields/nodes, start/end invariants, registered handler/router references, reachability, and a structural path to =end=.
+Closed state reducers include =replace=, =append=, and =sum=. Supported state types include atom, string, integer, number, boolean, list, dict, and any.
 
-Loops are allowed structurally, but runtime budgets cap total steps and visits per node.
+Loops are allowed structurally, but total steps and per-node visits are bounded at runtime.
 
-* 23. Graph interrupts, checkpoints, and resume
+* 21. Interrupt, checkpoint, and resume
 
-Open an in-memory checkpoint backend:
+Open a memory backend:
 
 #+begin_src prolog
 graph_backend_open(memory, Backend).
@@ -989,13 +899,13 @@ graph_resume(
     Outcome).
 #+end_src
 
-Resume can atomically include a state patch:
+A resume value can include an atomic state patch:
 
 #+begin_src prolog
 resume(approved, _{approved:true})
 #+end_src
 
-The persistent backend is:
+Persistent journal:
 
 #+begin_src prolog
 graph_backend_open(
@@ -1003,21 +913,23 @@ graph_backend_open(
     Backend).
 #+end_src
 
-The repository tests restart a graph across two separate =swipl= processes, which is the right kind of durability test: it proves the resumed process reconstructs executable closures from code while loading only persisted ground graph state/events.
+The repo tests persistence across two separate =swipl= processes. That matters: executable closures are loaded again from code, while only serializable graph snapshots/events persist.
 
-* 24. Durable artifacts are not transcripts
+Interrupt semantics also avoid blindly replaying the interrupting side effect: the patch and outgoing edge are resolved before the run is paused.
 
-Artifacts solve a different problem from graph checkpoints.
+* 22. Durable artifacts are not transcripts
+
+Keep three concepts separate:
 
 #+begin_example
-conversation transcript
-    = model-local history
+provider/model transcript
+    -> model interaction history
 
 graph checkpoint
-    = execution state for resuming a run
+    -> execution state needed to resume a graph
 
 artifact store
-    = selected durable summaries/findings/blackboards shared across runs
+    -> selected durable summaries/findings/blackboards for later work
 #+end_example
 
 Open a store:
@@ -1026,7 +938,7 @@ Open a store:
 artifact_store_open(memory, ok(Store)).
 #+end_src
 
-Publish:
+Publish an immutable version:
 
 #+begin_src prolog
 artifact_put(
@@ -1039,9 +951,7 @@ artifact_put(
     Outcome).
 #+end_src
 
-The store allocates immutable monotonically increasing versions per namespace/key.
-
-Build a bounded fresh-root pack:
+Build a bounded context pack for a fresh root:
 
 #+begin_src prolog
 artifact_context_pack(
@@ -1051,34 +961,11 @@ artifact_context_pack(
     Outcome).
 #+end_src
 
-A later root gets selected compact state, not an implicit replay of every earlier model message.
+A new root receives the selected compact artifact state, not an implicit replay of all prior conversation.
 
-* 25. Stale artifact references are explicit
+New writes to a namespace/key supersede older versions without deleting history. =artifact_ref_status/3= can distinguish current, stale, missing-version, and missing refs.
 
-Artifacts are immutable by version.
-
-Writing a newer version supersedes the old one without deleting it.
-
-Use:
-
-#+begin_src prolog
-artifact_ref_status(Store, Ref, Outcome).
-#+end_src
-
-Status can distinguish:
-
-#+begin_src prolog
-current(Ref).
-stale(OldRef, CurrentRef).
-missing_version(OldRef, CurrentRef).
-missing(Ref).
-#+end_src
-
-This is useful for agents/graphs because a checkpoint can safely retain an old ref and the fresh process can resolve it to current state while preserving evidence that supersession happened.
-
-* 26. Adaptive recursion: recurse only when it wins
-
-The adaptive layer does not treat “more recursion” as automatically smarter.
+* 23. Adaptive recursion means “choose a route,” not “recurse harder”
 
 Canonical routes include:
 
@@ -1088,7 +975,7 @@ Canonical routes include:
 - =recursive_rlm=;
 - =delegated_subagent=.
 
-Ask for a decision:
+Ask for a route:
 
 #+begin_src prolog
 Signals = _{
@@ -1109,40 +996,13 @@ Signals = _{
 recursion_route(Signals, [], Outcome).
 #+end_src
 
-The policy compares expected utility with estimated cost and selects a bounded candidate set.
-
 The design target is:
 
 #+begin_quote
 Choose the cheapest bounded execution form with enough expected utility.
 #+end_quote
 
-not:
-
-#+begin_quote
-Recurse until max depth.
-#+end_quote
-
-* 27. Depth greater than one is deliberately gated
-
-Normal production recursion is depth 1.
-
-Merely setting:
-
-#+begin_src prolog
-max_recursion_depth(4)
-#+end_src
-
-is not enough for deeper adaptive recursion.
-
-The experimental deep-recursion path requires both:
-
-#+begin_src prolog
-allow_deep_recursion(true).
-deep_recursion_capability(true).
-#+end_src
-
-There are also duplicate-subproblem and no-progress guards:
+There are explicit fingerprint and progress guards:
 
 #+begin_src prolog
 recursion_fingerprint(Subject, Fingerprint).
@@ -1154,15 +1014,22 @@ recursion_guard(
     Outcome).
 #+end_src
 
-This is a better mental model than pretending “recursive” means uncontrolled self-calling.
+Normal adaptive recursion is depth 1. The experimental deeper path requires both:
 
-* 28. MCP is a protocol boundary, not the core model backend
+#+begin_src prolog
+allow_deep_recursion(true).
+deep_recursion_capability(true).
+#+end_src
 
-=rlm_mcp= normalizes MCP into version-neutral Prolog terms.
+Merely changing the numeric maximum is intentionally insufficient in the adaptive policy layer.
 
-Supported protocol generations in the current implementation are:
+* 24. MCP is a protocol boundary, not the inference backend
 
-- =2025-11-25= -- sessionful initialize/initialized lifecycle;
+=rlm_mcp= gives the rest of the runtime a canonical Prolog representation of MCP.
+
+The current implementation supports:
+
+- =2025-11-25= -- legacy initialize/initialized lifecycle with optional session state;
 - =2026-07-28= -- stateless self-describing requests with =server/discover=.
 
 Canonical commands look like:
@@ -1177,53 +1044,53 @@ list_prompts.
 get_prompt(Name, Arguments).
 #+end_src
 
-The rest of the runtime should not care about protocol-date strings, JSON-RPC method names, session headers, or 2026 routing headers.
-
-The architecture is:
+The desired dependency direction is:
 
 #+begin_example
 transport
-  -> protocol detection / negotiation
+  -> protocol negotiation/detection
   -> version adapter
   -> canonical mcp_command{}
   -> canonical dispatch
   -> version adapter
-  -> transport response
+  -> transport
 #+end_example
 
-A critical design decision: MCP Sampling is not promoted into the core inference path. OpenRouter/OpenAI-compatible provider code remains the model-completion backend; MCP is used for tools/resources/prompts and protocol interoperability.
+Protocol dates, JSON-RPC method strings, routing headers, and legacy session state should not leak into agent, graph, plan, completion, or chain semantics.
 
-* 29. Run the benchmark harness
+MCP Sampling is not the core model path here. Provider-native model completion remains separate.
 
-The deterministic benchmark/conformance entrypoint is:
+* 25. Benchmark and conformance harness
+
+Run deterministic evaluation:
 
 #+begin_src sh
 swipl -q -s benchmark/run.pl -- deterministic
 #+end_src
 
-Write JSON to a file:
+Write JSON:
 
 #+begin_src sh
 swipl -q -s benchmark/run.pl -- deterministic report.json
 #+end_src
 
-The live integration benchmark is:
+Live OpenRouter integration:
 
 #+begin_src sh
 OPENROUTER_API_KEY='...' \
   swipl -q -s benchmark/run.pl -- integration live-report.json
 #+end_src
 
-The runner prints a human summary to stderr, emits JSON to stdout or a requested file, and exits nonzero when the report status is not =pass=.
+The runner prints a human summary to stderr, emits JSON to stdout or a file, and exits nonzero when the report does not pass.
 
-Do not compare RLM strategies only by “did the answer look good.” Track model calls, tokens, cost, latency, recursion depth, inspected context bytes, tool calls, plan rejections, and repair behavior.
+Evaluation should track more than answer vibes. Measure model calls, tokens, cost, latency, recursion depth, context bytes inspected, tool calls, plan rejection, and repair behavior.
 
-* 30. How to read this repository efficiently
+* 26. Recommended repository reading order
 
-Recommended reading order:
+Read it in the same direction the runtime works:
 
 1. =README.md=;
-2. =prolog/rlm.pl= -- see the public surface;
+2. =prolog/rlm.pl=;
 3. =prolog/rlm_context.pl=;
 4. =test/rlm_context_test.pl=;
 5. =prolog/rlm_plan.pl=;
@@ -1240,108 +1107,113 @@ Recommended reading order:
 16. =prolog/rlm_graph.pl=;
 17. =prolog/rlm_artifact.pl=;
 18. =prolog/rlm_recursion_policy.pl= and =rlm_recursion_runtime.pl=;
-19. =prolog/rlm_mcp.pl= and version adapters;
+19. =prolog/rlm_mcp.pl= and its version adapters;
 20. =benchmark/=;
-21. research records last, once the executable architecture is clear.
+21. research records after the executable architecture is clear.
 
-Why this order? It follows the actual control path from bounded context data to model-selected execution, then adds orchestration/durability/protocol layers.
+Starting at MCP gives you protocol details too early. Starting at the planner prompt hides the bounded context and typed-plan substrate. Start with the data/control boundaries first.
 
-* 31. Debugging playbook
+* 27. Debugging playbook
 
-**Case: context operation returns the wrong data**
+**Context operation returns bad data**
 
-Reproduce through =rlm_context= directly. Inspect the handle metadata and =context_trace/3=. Do not start by changing planner prompts.
+Call =rlm_context= directly. Inspect metadata and =context_trace/3=. Do not begin by tweaking the LLM prompt.
 
-**Case: model returned a plan but nothing executed**
+**Planner returns something but no plan runs**
 
-Run =plan_parse/2=, then =plan_validate/4=. Inspect the normalized AST and required capability set. A rejected plan is supposed to have no side effects.
+Call =plan_parse/2= and =plan_validate/4=. Inspect the normalized AST and capability requirements.
 
-**Case: tool is named correctly but denied**
+**Tool name is correct but denied**
 
-Check both the plan capabilities and the registry schema's declared capability. Then verify the child/root authority boundary.
+Check the active capability set and the schema's declared =tool(Name)= capability. Then check whether you crossed a root/child narrowing boundary.
 
-**Case: tool is allowed but handler never runs**
+**Tool never reaches its handler**
 
-Check schema validation first. Authorization occurs before arguments/handler execution, and malformed args also fail before the handler.
+Authorization and argument schema validation happen first. A malformed call should not reach trusted code.
 
-**Case: completion runs out of model calls unexpectedly**
+**Model-call budget disappears too fast**
 
-Count the root planner call plus every model step, recursive model step, retry multiplier, and planner retry. Budgets are shared, not reset per nested plan.
+Count the root planner call, planner retries, plan model steps, recursive model steps, and retry multipliers. Nested execution shares budgets.
 
-**Case: child RLM can use a root-only tool**
+**Child uses a root-only tool**
 
-That is a bug. Inspect =child_capabilities= and recursive plan validation. Children must narrow authority.
+Treat that as a bug. Child authority must be a subset and recursive plan validation is supposed to reject widening.
 
-**Case: agent count is high and machine threads explode**
+**Twenty logical agents cause twenty idle OS threads**
 
-That violates the runtime design. Logical agents should live in engines/state machines while blocking work is constrained by the shared worker pool.
+That violates the runtime architecture. Logical state belongs in engines; blocking work belongs in the bounded worker pool.
 
-**Case: graph resumes by repeating a side effect**
+**Graph resumes by repeating the interrupt side effect**
 
-Inspect interrupt semantics and persisted next-node state. An interrupt applies its patch and resolves the outgoing edge before pause so resume should not blindly repeat the interrupting node.
+Inspect the persisted next node and interrupt semantics. The runtime should resolve the transition before pause.
 
-**Case: fresh root has huge prompt history**
+**Fresh root prompt contains the full prior transcript**
 
-You are probably confusing durable artifact context with transcript replay. Build an explicit bounded artifact pack instead.
+You are probably using chat history where you meant durable artifacts. Build a bounded artifact pack.
 
-**Case: MCP protocol condition leaks into agent/graph code**
+**MCP protocol date appears inside agent/graph code**
 
-Move it back behind =rlm_mcp= / version adapters. Protocol-date branching is supposed to stop at that boundary.
+Push that version-specific behavior back into the MCP adapter boundary.
 
-* 32. How to extend the runtime safely
+* 28. Extend the system without breaking its core safety model
 
-Suppose you want to add a new context transform named =normalize_whitespace=.
+Suppose you want a new pure context transform =normalize_whitespace=.
 
-A disciplined implementation order is:
+Use this order:
 
-1. define exact semantics and bounds;
-2. add it to the closed context transform vocabulary;
-3. implement the deterministic transform in =rlm_context=;
+1. define exact deterministic semantics;
+2. add it to the closed transform vocabulary;
+3. implement it in =rlm_context=;
 4. add positive and negative context tests;
-5. expose the operation through typed-plan normalization if required;
-6. ensure capability derivation remains =context(map)= rather than inventing ambient authority;
+5. expose it through plan normalization only if needed;
+6. keep the authority under =context(map)=;
 7. test plan validation and execution;
-8. test output-byte and time limits;
-9. run the whole deterministic suite;
-10. add/update docs only after behavior is executable.
+8. test byte/time limits;
+9. run the full deterministic suite;
+10. update docs after behavior exists.
 
-Suppose instead you want a new side-effecting operation.
-
-Do *not* put it into context =map=. Make it a capability-gated tool or another explicit trusted runtime boundary.
-
-That distinction is foundational:
+If the new operation has a side effect, do *not* stuff it into context =map=. Put it behind a trusted tool or dedicated capability boundary.
 
 #+begin_example
-pure bounded data projection -> context runtime
-side effect / host capability -> trusted tool or dedicated subsystem
+pure bounded projection
+    -> context runtime
+
+side effect / host authority
+    -> trusted tool or dedicated runtime subsystem
 #+end_example
 
-* 33. Major project: build a bounded repository-analysis RLM
+That separation is foundational.
 
-The capstone is to build an RLM that analyzes a source repository without giving the model ambient filesystem execution.
+* 29. Major project: bounded repository-analysis RLM
 
-The target flow:
+Build an RLM that can analyze a source repository without granting ambient filesystem execution.
+
+Target architecture:
 
 #+begin_example
-repository root
-   |
-   v
-project_read tool registry
-   |
+configured repository root
+          |
+          v
+ project_read registry
+          |
+          v
 query + opaque task context
-   |
-root planner
-   |
-   +--> bounded context slice/search
-   +--> project_read selected files
-   +--> optional depth-1 child model
-   |
-structured result
-   |
-selected durable artifact
+          |
+          v
+      root planner
+       /    |    \
+      /     |     \
+ context  tool   depth-1 child
+   ops     read      model
+      \     |       /
+       \    |      /
+        structured result
+              |
+              v
+       selected artifact
 #+end_example
 
-**Step 1: create the tool registry**
+**Step 1: registry**
 
 #+begin_src prolog
 tool_registry_create(Registry),
@@ -1352,7 +1224,7 @@ register_project_read_tool(
     ok(_)).
 #+end_src
 
-**Step 2: define the root authority**
+**Step 2: root authority**
 
 #+begin_src prolog
 RootCaps = [
@@ -1364,29 +1236,25 @@ RootCaps = [
 ].
 #+end_src
 
-**Step 3: narrow child authority**
-
-Start with:
+**Step 3: child authority**
 
 #+begin_src prolog
 ChildCaps = [model(openrouter)].
 #+end_src
 
-The child may reason over selected material but cannot independently read arbitrary additional project files.
+The child can reason over selected material but cannot independently read more files.
 
-**Step 4: use a small opaque task context**
+**Step 4: task context**
 
 #+begin_src prolog
 TaskContext = text(
     "Find the runtime entrypoint, identify the execution safety boundary, and explain which module owns recursive execution.").
 #+end_src
 
-**Step 5: make the planner select evidence rather than dump the repository**
-
-Grant only a small number of context/tool operations:
+**Step 5: assign a bounded budget**
 
 #+begin_src prolog
-budget(_{
+Budget = _{
     max_recursion_depth:1,
     max_model_calls:4,
     max_tool_calls:3,
@@ -1395,10 +1263,10 @@ budget(_{
     max_cost_usd:0.25,
     max_output_bytes:32768,
     time_limit:120.0
-}).
+}.
 #+end_src
 
-**Step 6: run =rlm_completion/4=**
+**Step 6: run the root supervisor**
 
 #+begin_src prolog
 rlm_completion(
@@ -1412,212 +1280,179 @@ rlm_completion(
     Outcome).
 #+end_src
 
-**Step 7: inspect the trajectory**
+**Step 7: inspect evidence, not just the final text**
 
-Do not read only =Result.value=. Verify:
+Verify:
 
 - which context operations ran;
-- which files were selected;
+- which project files were selected;
 - tool authorization status;
 - model-call count;
 - actual recursion depth;
 - child capability set;
-- token/cost metadata when known;
-- whether any plan was rejected/retried.
+- usage/cost metadata when known;
+- whether any plan was rejected or retried.
 
-**Step 8: publish only the useful result**
+**Step 8: publish selected durable state**
 
-Open an artifact store and save a compact summary/finding with provenance. Do not store the full provider transcript as the default durable state.
+Store a compact architecture summary/finding as an artifact with provenance. Do not make the full provider transcript your default memory model.
 
 **Step 9: start a fresh root**
 
-Build an artifact context pack and use it in a later task. Confirm the new root can continue from selected durable findings without receiving the entire earlier conversation.
+Build an artifact context pack and continue from that selected state. Confirm the new reasoning root does not need the original transcript.
 
-**Step 10: add a graph around the workflow**
-
-Wrap the stages in a graph:
+**Step 10: put a graph around it**
 
 #+begin_example
 collect_evidence
-      |
-      v
-analyze
-      |
-      v
-review
-   /      \
-retry   publish
-           |
-           v
-          end
+       |
+       v
+    analyze
+       |
+       v
+     review
+    /      \
+ retry    publish
+             |
+             v
+            end
 #+end_example
 
-Use a bounded loop for review/retry. Add an interrupt before publication if you want a human approval gate.
+Use a bounded review loop. Add a graph interrupt before publication if you want human approval.
 
-This project forces you to use the repository's actual architecture instead of treating it as “LLM calls Prolog somehow.”
+* 30. Project extension: adaptive routing
 
-* 34. Major project extension: adaptive routing
+Once the capstone works, stop forcing every task through recursion.
 
-After the capstone works, stop forcing every task through recursion.
-
-Compute routing signals from the task:
+Compute routing signals such as:
 
 - context size;
 - uncertainty;
 - task complexity;
 - branch diversity;
 - remaining model calls/tokens;
-- whether deterministic context operations can solve it;
-- whether a cheap model or delegated agent is available.
+- deterministic context availability;
+- cheap submodel availability;
+- delegated agent availability.
 
-Use =recursion_route/3= first.
+Then call =recursion_route/3= first.
 
-Expected behavior should look like:
+A healthy policy should often look something like:
 
 #+begin_example
-small exact extraction
+exact extraction
     -> deterministic_context
 
-small semantic question
+small semantic task
     -> direct_continuation or cheap_submodel
 
-huge decomposable context
+large decomposable context
     -> recursive_rlm
 
-tool-heavy branching investigation
+branching tool-heavy investigation
     -> delegated_subagent
 #+end_example
 
-Measure whether routing actually improves cost/latency/quality under fixed budgets. If it does not, change the policy instead of assuming more layers equal more intelligence.
+Benchmark the policy under fixed budgets. If recursion costs more without improving results, the answer is not “increase recursion depth.”
 
-* 35. Common mistakes
+* 31. Common mistakes
 
-**Mistake: “RLM means recursively call the model a bunch.”**
+**“RLM means recursively call the model repeatedly.”**
 
-No. Recursion is one bounded strategy among several.
+No. Recursion is one bounded execution route.
 
-**Mistake: “Prolog plan means eval model-generated Prolog.”**
+**“Typed plan means evaluate model-generated Prolog.”**
 
-No. The plan language is a closed AST and JSON model output never falls back to arbitrary =read_term/3= execution.
+No. Plans are a closed AST and JSON model output remains data.
 
-**Mistake: “If the tool exists, the model can use it.”**
+**“If the tool exists, the model can use it.”**
 
-No. It needs registration *and* capability authorization.
+No. Registration and capability authorization are both required.
 
-**Mistake: “A child inherits everything.”**
+**“Children inherit all authority.”**
 
-No. Child authority is narrowing-only.
+No. Child authority narrows.
 
-**Mistake: “A retry gets a fresh budget.”**
+**“Retries and repairs get fresh budgets.”**
 
-No. Runtime counters remain consumed.
+No. Consumed runtime budget remains consumed.
 
-**Mistake: “Graph state is agent memory.”**
+**“Graph checkpoint equals long-term agent memory.”**
 
-Not exactly. Graph checkpoints are resumable execution state. Artifacts are cross-run selected durable knowledge. Provider transcript is a third thing.
+No. Checkpoint, artifact, and transcript are deliberately separate concepts.
 
-**Mistake: “MCP should be the model backend.”**
+**“MCP should be the model provider.”**
 
-Not in this architecture. Provider-native model completion remains separate.
+Not in this architecture. Provider-native inference remains separate.
 
-**Mistake: “TODO says unchecked, so it is unimplemented.”**
+**“TODO checkbox means implementation status.”**
 
-Not currently. Check code and tests.
+Not currently. Verify source and tests.
 
-* 36. What to inspect next
-
-After this tutorial, read these files with a SWI REPL open:
-
-- =prolog/rlm.pl= -- public facade and readiness contract;
-- =prolog/rlm_context.pl= -- bounded data substrate;
-- =prolog/rlm_plan.pl= -- closed execution language;
-- =prolog/rlm_tool.pl= -- capability/handler boundary;
-- =prolog/rlm_chain.pl= -- provider abstraction;
-- =prolog/rlm_completion.pl= -- root RLM supervisor;
-- =prolog/rlm_outcome.pl= -- classification/inspection/repair;
-- =prolog/rlm_agent.pl= -- logical agents and supervision;
-- =prolog/rlm_graph.pl= -- durable graphs;
-- =prolog/rlm_artifact.pl= -- durable cross-run state;
-- =prolog/rlm_recursion_policy.pl= -- adaptive decision policy;
-- =prolog/rlm_recursion_runtime.pl= -- selected-route execution;
-- =prolog/rlm_mcp.pl= -- protocol-neutral MCP facade;
-- =test/rlm_completion_test.pl= -- deterministic supervisor behavior;
-- =test/live_completion_openrouter_test.pl= -- real planner/context/tool/child integration;
-- =test/rlm_agent_test.pl= -- engine/mailbox/worker behavior;
-- =test/rlm_graph_test.pl= -- graph validation/persistence/cancellation;
-- =benchmark/rlm_conformance.pl= -- what the project measures.
-
-* 37. Completion checklist
+* 32. Completion checklist
 
 You understand =prolog-rlm= at a working level when you can do all of this without guessing:
 
-- [ ] Run =test/check_runtime.pl= and =test/load_all.pl=.
-- [ ] Run the complete deterministic PlUnit suite.
-- [ ] Explain why external context is stored behind opaque handles.
-- [ ] Use bounded context search/slice/partition/map/reduce.
-- [ ] Explain why context operations cannot execute arbitrary predicates.
+- [ ] Run runtime/load checks and the deterministic suite.
+- [ ] Explain why context is held behind opaque handles.
+- [ ] Use bounded context peek/slice/search/partition/map/reduce.
+- [ ] Explain why context operations cannot execute arbitrary model predicates.
 - [ ] Parse, validate, and execute a typed plan without an LLM.
-- [ ] Explain the difference between model-selected names and trusted host closures.
-- [ ] Register a custom schema-validated tool.
-- [ ] Use =project_read= without granting ambient filesystem access.
-- [ ] Configure OpenRouter and another OpenAI-compatible provider.
+- [ ] Explain the difference between model-selected names and host closures.
+- [ ] Register and invoke a schema-validated tool.
+- [ ] Use =project_read= without ambient filesystem authority.
+- [ ] Configure OpenRouter and another compatible provider.
 - [ ] Explain =llm_query/3=, =rlm_query/4=, and =rlm_completion/4=.
-- [ ] Explain root planner cost versus recursive child model calls.
-- [ ] Explain why recursion defaults to depth 1.
-- [ ] Demonstrate child capability narrowing.
-- [ ] Explain every major completion budget dimension.
-- [ ] Cancel a running completion using a token.
-- [ ] Classify logical failure separately from exceptions/timeouts/capability denial.
-- [ ] Use =plan_inspect/4= before execution.
-- [ ] Explain why plan repair does not reset budget.
-- [ ] Create a supervised logical-agent runtime.
-- [ ] Demonstrate mailbox backpressure or worker-pool saturation safely.
-- [ ] Compile a declarative graph against trusted handlers.
+- [ ] Account for the root planner in model-call budget.
+- [ ] Demonstrate root/child capability narrowing.
+- [ ] Cancel a running completion.
+- [ ] Distinguish logical failure, timeout, capability denial, validation failure, and exception.
+- [ ] Use plan inspection before execution.
+- [ ] Explain why repair does not reset budget.
+- [ ] Create supervised logical agents.
+- [ ] Explain finite mailbox backpressure and bounded workers.
+- [ ] Compile a graph against trusted handlers.
 - [ ] Interrupt, checkpoint, and resume a graph.
-- [ ] Publish and version a durable artifact.
+- [ ] Publish and version an artifact.
 - [ ] Build a bounded artifact context pack for a fresh root.
-- [ ] Explain stale artifact ref resolution.
-- [ ] Ask adaptive recursion policy for a route and explain the decision.
-- [ ] Explain why deep recursion requires explicit experimental gates.
-- [ ] Explain the MCP version-adapter boundary.
-- [ ] Run deterministic benchmark/conformance mode.
-- [ ] Run a real OpenRouter integration when credentials are available.
-- [ ] Complete the bounded repository-analysis capstone.
+- [ ] Ask adaptive recursion policy for a route and explain why it chose it.
+- [ ] Explain the deeper-recursion experimental gate.
+- [ ] Explain why MCP version branching stops at the adapter boundary.
+- [ ] Run deterministic benchmark mode.
+- [ ] Run live OpenRouter integration when credentials are available.
+- [ ] Complete the bounded repository-analysis project.
 
-* 38. Final mental model
-
-Keep this model in your head:
+* 33. Final mental model
 
 #+begin_example
 LLM
-  chooses strategy
-       |
-       v
+  chooses semantic strategy
+          |
+          v
 closed symbolic data
-       |
-       v
-Prolog supervisor
+          |
+          v
+Prolog runtime
+  parses
   validates
   authorizes
   budgets
   executes
   traces
-       |
-       +--> opaque context operations
-       +--> model providers
-       +--> trusted tools
-       +--> bounded recursive calls
-       +--> supervised agents
-       +--> durable graphs
-       +--> durable artifacts
-       +--> canonical MCP
-       |
-       v
+          |
+          +--> opaque context operations
+          +--> model providers
+          +--> trusted tools
+          +--> bounded recursive calls
+          +--> supervised logical agents
+          +--> durable graphs
+          +--> durable artifacts
+          +--> canonical MCP
+          |
+          v
 structured outcome
 #+end_example
 
-The point is not “use Prolog because Prolog is cool.”
-
-The point is that Prolog is being used as a constrained symbolic control substrate: explicit terms, validation, rules, search, structured failure, capabilities, supervision, and durable state around probabilistic model decisions.
+Prolog is not here merely because the syntax is convenient. It is being used as a symbolic control substrate around probabilistic model decisions: explicit terms, validation, capability rules, search, structured failure, supervision, and durable state.
 
 That is the architecture to preserve when extending =prolog-rlm=.
