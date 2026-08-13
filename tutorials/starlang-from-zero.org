@@ -1,0 +1,1189 @@
+:PROPERTIES:
+:ID:       41d65192-9402-4597-940d-3fb304e6ebc9
+:END:
+#+title: StarLang from Zero: Compiler, Contracts, Documents, and Durable Actors
+#+filetags: :starlang:tutorial:common-lisp:actors:starintel:
+#+property: repo https://github.com/lost-rob0t/star-lang
+#+property: source_ref main
+
+* Goal
+
+This tutorial is for learning StarLang well enough to modify it, debug it, extend it, and build real StarIntel contracts on top of it.
+
+By the end you should be able to:
+
+- explain why =.star= syntax is Lisp-shaped but is *not* Common Lisp;
+- trace a source file through parsing, macro expansion, validation, and compilation;
+- write versioned StarLang spec libraries;
+- define scalars, enums, documents, messages, inheritance, and ID policies;
+- load a spec library from Common Lisp;
+- construct, encode, decode, and relate StarLang documents;
+- understand where normalized IR ends and runtime behavior begins;
+- locate actor dispatch, runtime directory, journal, lease, transport, and Sento boundaries;
+- debug parser/compiler/runtime failures from the correct layer;
+- run the authoritative ASDF and Nix test contracts;
+- complete a practical BBP-style domain-contract project.
+
+StarLang's canonical project node is [[id:1111004a-95fd-488b-979b-e8433431e299][StarLang]]. Keep [[id:dca7bf46-7062-4e34-bfaf-8bec6e520a42][StarLang Compiler and Runtime Architecture]] open while working through the implementation sections.
+
+* 1. What StarLang actually is
+
+The shortest correct description is:
+
+#+begin_quote
+StarLang is a Common Lisp implementation of a closed contract language plus a durable actor runtime.
+#+end_quote
+
+The implementation repository contains both language/compiler concerns and runtime concerns. The current code is transitional: =prototype/= is authoritative and the final =star-*= / =starlang-*= systems are being extracted incrementally.
+
+This distinction matters because you will see directories such as =star-journal/= and =starlang-runtime/= while much of the real implementation still lives in =prototype/=. Do not assume an empty or thin final-system directory means that feature does not exist; check the migration map in the repository README and then inspect =prototype/=.
+
+**Critical rule:** =.star= files are never source for the Common Lisp reader.
+
+They deliberately use an S-expression surface syntax, but StarLang owns parsing and semantics. That gives the implementation control over:
+
+- exact identifiers;
+- source spans;
+- parser resource limits;
+- macro hygiene;
+- import provenance;
+- deterministic normalization;
+- source-level error reporting;
+- rejection of arbitrary reader/evaluator behavior.
+
+If you remember one sentence from this section, remember:
+
+#+begin_quote
+Parentheses are syntax; Common Lisp evaluation is not semantics.
+#+end_quote
+
+* 2. Get the repository running
+
+Clone the project:
+
+#+begin_src sh
+ git clone https://github.com/lost-rob0t/star-lang
+ cd star-lang
+#+end_src
+
+The normal reproducible entry points are Nix:
+
+#+begin_src sh
+nix develop
+nix build
+nix run
+nix run .#tests
+nix flake check -L
+#+end_src
+
+The authoritative ASDF test contract is:
+
+#+begin_src sh
+sbcl --non-interactive \
+  --eval '(require :asdf)' \
+  --eval '(asdf:load-system :starlang-prototype)' \
+  --eval '(asdf:test-system :starlang-prototype)' \
+  --eval '(sb-ext:quit)'
+#+end_src
+
+The development image can be loaded interactively:
+
+#+begin_src lisp
+(require :asdf)
+(asdf:load-system :starlang-prototype)
+#+end_src
+
+Why test through ASDF instead of manually loading random files? Because =starlang-prototype.asd= encodes the implementation's transitional dependency order, and the test system runs individual prototype tests in fresh child SBCL processes. That catches accidental package/load-order coupling that a dirty REPL can hide.
+
+**Exercise:** before reading farther, open =starlang-prototype.asd=. Read the component order top to bottom. Treat it as a compact architecture diagram.
+
+* 3. The compiler pipeline
+
+The public pipeline is:
+
+#+begin_example
+UTF-8 source bytes
+  -> read-star-syntax
+  -> locked import resolution
+  -> expand-star-syntax
+  -> validate-star-core
+  -> compile-star-core
+  -> normalized runtime-neutral IR
+#+end_example
+
+The convenience facade is in =prototype/star-lang-api.lisp=:
+
+#+begin_src lisp
+star-lang.api:read-star-syntax
+star-lang.api:expand-star-syntax
+star-lang.api:validate-star-core
+star-lang.api:compile-star-core
+star-lang.api:load-star
+star-lang.api:load-star-file
+star-lang.api:load-star-url
+#+end_src
+
+Do not collapse these phases mentally. Bugs have different ownership depending on the phase.
+
+**Parser bug**
+
+The source cannot be represented correctly as syntax nodes, or source spans/limits are wrong.
+
+**Expansion bug**
+
+A valid parsed declaration is transformed incorrectly, hygiene/provenance is lost, or expansion exceeds allowed behavior.
+
+**Validation bug**
+
+Invalid core syntax is accepted, or valid core syntax is rejected.
+
+**Compiler bug**
+
+Validated syntax produces the wrong normalized IR / manifest representation.
+
+**Runtime bug**
+
+Correct compiled contracts execute incorrectly after loading.
+
+That phase separation is your first debugging filter.
+
+* 4. Syntax objects: why StarLang does not just use lists
+
+Open =prototype/core-surface-prototype.lisp= and find =defstruct star-syntax=.
+
+A syntax node records:
+
+#+begin_src lisp
+(defstruct star-syntax
+  kind
+  datum
+  children
+  span
+  (scopes nil)
+  origin
+  introduced-by
+  expansion-trace
+  macro-dependencies)
+#+end_src
+
+That structure is a huge architectural clue.
+
+A plain list can tell you that you parsed something resembling:
+
+#+begin_src lisp
+(document person ...)
+#+end_src
+
+A =star-syntax= tree can additionally answer:
+
+- exactly where did this occurrence appear?
+- did a macro introduce it?
+- which scopes are attached to it?
+- what imported library/macro definition did it originate from?
+- what expansion chain produced it?
+- which syntax occurrence is this, independent of equal-looking data?
+
+The explicit conversion =star-syntax-to-datum= is lossy. Once you flatten syntax into data, you discard the information needed for robust source tooling and hygienic expansion.
+
+**Rule for compiler work:** keep syntax objects alive until a phase explicitly no longer needs syntax identity/provenance.
+
+* 5. Parser limits are language semantics
+
+The parser has explicit bounded resource limits. Current defaults include roughly:
+
+- source size: 16 MiB;
+- nesting depth: 128;
+- node count: 100,000;
+- token bytes: 65,536;
+- string bytes: 4 MiB;
+- collection length: 100,000;
+- bounded numeric literal bytes/magnitude.
+
+These values live in =make-star-parser-limits=.
+
+Why does this belong in a language tutorial? Because a parser for untrusted contracts is an attack surface. If you add a new collection literal, macro facility, string escape, or numeric form, you must ask whether it creates an unbounded parse/expand path.
+
+A feature that works but bypasses resource accounting is not complete.
+
+* 6. Your first spec library
+
+Now write a minimal file =demo.star=:
+
+#+begin_src lisp
+(spec-library "org.example/demo@1"
+  (:version "1.0.0")
+
+  (scalar object-id
+    (:base string
+     :pattern "^[a-z0-9-]+$"))
+
+  (enum job-status
+    (queued running completed failed))
+
+  (document job
+    (:persistence persistent)
+    (id object-id :required)
+    (status job-status :required))
+
+  (message run-job
+    (:fields
+     ((id object-id :required)))))
+#+end_src
+
+There are four concepts here.
+
+**Spec library identity**
+
+#+begin_src lisp
+(spec-library "org.example/demo@1" ...)
+#+end_src
+
+The library has a stable logical identity including a major contract generation.
+
+**Library version**
+
+#+begin_src lisp
+(:version "1.0.0")
+#+end_src
+
+This is the exact version of the library content/protocol.
+
+**Declarations**
+
+The body contains typed declarations such as scalar, enum, document, message, macro, actor-related forms, and imports depending on the supported core.
+
+**Portable meaning**
+
+These declarations compile into data-only normalized IR. They are not instructions like “call CL-GServer function X.” Runtime-specific actions stay behind adapters/runtime boundaries.
+
+See [[id:c91d5283-f96e-4d95-92f6-a926ea6951f5][StarLang Spec Libraries and Portable Contracts]] for the conceptual model.
+
+* 7. Imports: dependency locking, not package discovery
+
+A fixture from =fixtures/bbp-domain.star= uses:
+
+#+begin_src lisp
+(import "org.starintel/core@1"
+  :version "1.0.0"
+  :digest "sha256:core-v1-research-fixture")
+#+end_src
+
+The intended security/reproducibility boundary is stricter than that fixture-looking digest string: production imports are expected to be exact-versioned, full SHA-256 locked, locally compiled, and HTTPS-only when remote resolution is explicitly enabled.
+
+The mental model is closer to a content-addressed compiler dependency than to =(use-package ...)=.
+
+When debugging an import failure, ask:
+
+1. Did the parser read a valid import form?
+2. Is the library identity exact?
+3. Is the requested version exact?
+4. Does the digest match the actual imported source?
+5. Is remote resolution enabled at all?
+6. If remote, is the scheme allowed?
+7. Did the imported library itself compile successfully?
+
+Avoid solving a reproducibility error by making import matching fuzzy. That defeats the contract.
+
+* 8. Scalars: refine primitives into domain types
+
+StarLang scalars let domain types carry validation constraints.
+
+Examples from the real fixtures:
+
+#+begin_src lisp
+(scalar port-number
+  (:base integer
+   :minimum 0
+   :maximum 65535))
+
+(scalar confidence-score
+  (:base decimal
+   :minimum 0
+   :maximum 1
+   :scale 4))
+
+(scalar document-id
+  (:base string
+   :pattern "^[A-Za-z0-9._~:/+-]{1,512}$"))
+#+end_src
+
+Why not just declare every port as =integer=? Because =integer= says nothing about the protocol domain. A port has a closed numeric range. Encoding that once lets documents/messages inherit validation rather than reimplementing it in every actor.
+
+Useful base types visible in current contracts include:
+
+- =string=;
+- =integer=;
+- =decimal=;
+- =boolean=;
+- =symbol=;
+- =map=;
+- =reference=;
+- =iso-date=;
+- =iso-datetime=;
+- =(list TYPE)=.
+
+When designing a scalar, distinguish storage representation from semantic type. =document-id= can be represented by a string while still being a distinct contract type.
+
+* 9. Enums: protocol states should be closed when they are actually closed
+
+A real BBP enum:
+
+#+begin_src lisp
+(enum tool-run-status
+  (queued running completed failed cancelled))
+#+end_src
+
+This is ideal for actor/runtime state because callers should not invent =basically-done= or =sorta-running=.
+
+Prefer an enum when:
+
+- consumers need exhaustive handling;
+- values define a state machine or protocol;
+- accepting unknown strings would hide a bug.
+
+Prefer a string when:
+
+- external systems can legitimately add values;
+- forward compatibility requires unknown values;
+- the domain is not actually closed.
+
+* 10. Documents: persistent typed records
+
+A document declaration looks like:
+
+#+begin_src lisp
+(document tool-run
+  (:persistence persistent)
+  (runId run-id :required)
+  (programId program-id :required)
+  (tool tool-name :required)
+  (target string :required)
+  (argv (list string) :required)
+  (status tool-run-status :required)
+  (exitCode integer :optional)
+  (stdout string :optional)
+  (stderr string :optional)
+  (raw map :required))
+#+end_src
+
+Notice that StarLang field names preserve the serialized spelling. The system's wire/document/manifest contract uses lower camelCase. =runId= is not mechanically rewritten into Lisp-style =run-id= in the contract.
+
+That matters for deterministic manifests and compatibility across generated bindings.
+
+**Inheritance**
+
+Documents may extend another document:
+
+#+begin_src lisp
+(document person
+  (:extends document
+   :persistence persistent
+   :id-policy (:kind ulid))
+  (fname string :optional)
+  (lname string :optional))
+#+end_src
+
+The compiler/runtime must combine the inherited contract with local fields and metadata without losing source spelling or identity policy.
+
+* 11. ID policies
+
+StarLang's document runtime supports multiple identity strategies.
+
+**ULID**
+
+Useful for generated, time-sortable identities.
+
+#+begin_src lisp
+:id-policy (:kind ulid)
+#+end_src
+
+**UUIDv4**
+
+Useful for random generated identity.
+
+#+begin_src lisp
+:id-policy (:kind uuidv4)
+#+end_src
+
+**Digest identity**
+
+Useful when identity is derived deterministically from fields:
+
+#+begin_src lisp
+:id-policy (:kind digest
+            :algorithm md5
+            :fields (name reg country))
+#+end_src
+
+The runtime canonicalizes digest input. The tests explicitly check that maps with different key order produce the same digest.
+
+That invariant is essential for deduplication. Never make a digest ID depend on hash-table iteration order or incidental alist ordering.
+
+* 12. Messages are not documents
+
+A message declaration from BBP:
+
+#+begin_src lisp
+(message run-tool
+  (:fields
+   ((programId program-id :required)
+    (runId run-id :required)
+    (tool tool-name :required)
+    (target string :required)
+    (options map :optional))))
+#+end_src
+
+And a result message:
+
+#+begin_src lisp
+(message tool-run-completed
+  (:fields
+   ((programId program-id :required)
+    (runId run-id :required)
+    (tool tool-name :required)
+    (target string :required)
+    (argv (list string) :required)
+    (exitCode integer :required)
+    (stdout string :required)
+    (stderr string :required))))
+#+end_src
+
+The separation gives you a clean model:
+
+#+begin_example
+command/event protocol     persistence model
+----------------------     -----------------
+message                    document
+run-tool                    tool-run
+program-registered          program
+#+end_example
+
+A command can request a change without being the stored representation of that change.
+
+* 13. Load a StarLang library from Common Lisp
+
+The public facade lives in package =STAR-LANG.API=.
+
+Load a file:
+
+#+begin_src lisp
+(defparameter *graph*
+  (star-lang.api:load-star-file #P"fixtures/star-cl.star"))
+#+end_src
+
+Or load source through the generic loader:
+
+#+begin_src lisp
+(defparameter *graph*
+  (star-lang.api:load-star source))
+#+end_src
+
+For compiler debugging, call phases explicitly instead of using the convenience loader:
+
+#+begin_src lisp
+(let* ((syntax (star-lang.api:read-star-syntax source))
+       (expanded (star-lang.api:expand-star-syntax syntax)))
+  (star-lang.api:validate-star-core expanded)
+  (star-lang.api:compile-star-core expanded))
+#+end_src
+
+Why do this manually? Because when a full =load-star= call fails, phase-by-phase execution tells you whether the problem is parse, expansion, validation, or lowering.
+
+* 14. Construct documents at runtime
+
+The real document-runtime tests create a person like this:
+
+#+begin_src lisp
+(defparameter *person*
+  (star-lang.api:create-document
+   *graph*
+   "person"
+   '(("fname" . "Ada")
+     ("lname" . "Lovelace"))
+   :dataset "people"))
+#+end_src
+
+The runtime can fill contract metadata and ID policy fields. In current tests, the resulting person has a generated ULID and metadata such as dataset, qualified dtype, schema version, and timestamps.
+
+For a deterministic organization identity:
+
+#+begin_src lisp
+(defparameter *org-values*
+  '(("name" . "Analytical Engines Ltd")
+    ("reg" . "AE-1843")
+    ("country" . "GB")))
+
+(defparameter *org-a*
+  (star-lang.api:create-document
+   *graph* "org" *org-values* :dataset "orgs"))
+
+(defparameter *org-b*
+  (star-lang.api:create-document
+   *graph* "org" (reverse *org-values*) :dataset "orgs"))
+#+end_src
+
+If the document's ID policy is digest-based, =*org-a*= and =*org-b*= should receive the same ID even though the alist order differs.
+
+That is a perfect regression test whenever you touch canonicalization.
+
+* 15. Encode and decode documents
+
+Encode for a camelCase CouchDB-like representation:
+
+#+begin_src lisp
+(defparameter *encoded*
+  (star-lang.api:encode-document
+   *person*
+   :key-style :camel
+   :couchdb t))
+#+end_src
+
+Decode:
+
+#+begin_src lisp
+(defparameter *decoded*
+  (star-lang.api:decode-document
+   *graph*
+   "person"
+   *encoded*))
+#+end_src
+
+The test contract checks that identity and fields survive the round trip.
+
+When debugging serialization, separate three issues:
+
+1. contract correctness -- is the document field/type valid?
+2. normalized key spelling -- are canonical lower camelCase names preserved?
+3. transport/storage encoding -- does CouchDB mode add the expected storage keys?
+
+Do not fix a storage adapter mismatch by changing the language-level field name.
+
+* 16. Relations
+
+The document runtime can construct relation documents:
+
+#+begin_src lisp
+(defparameter *relation*
+  (star-lang.api:relate-documents
+   *graph*
+   *person*
+   *org-a*
+   :predicate "member-of"
+   :note "Ada and Analytical Engines"))
+#+end_src
+
+The repository currently contains compatibility handling around historical =target= versus canonical =destination= relation spelling. This is a good example of where compatibility belongs: at an explicit normalization boundary with warnings/tests, not as silent schema ambiguity spread everywhere.
+
+When changing a core field name:
+
+- define the canonical contract;
+- normalize old inputs at one compatibility boundary;
+- emit a warning or explicit migration signal;
+- serialize only the canonical representation;
+- test both legacy input and canonical output.
+
+* 17. Constructor generation
+
+The public API also exposes:
+
+#+begin_src lisp
+star-lang.api:install-constructors
+star-lang.api:generate-constructor-source
+star-lang.api:load-star-runtime
+#+end_src
+
+=load-star-runtime= can load a graph and optionally install constructors into a chosen Common Lisp package.
+
+Conceptually:
+
+#+begin_example
+.star contract
+   -> compiled graph
+   -> document contracts
+   -> generated/installed CL constructors
+   -> application code builds validated documents
+#+end_example
+
+This gives Common Lisp callers ergonomic construction without turning the StarLang language into Common Lisp macros.
+
+That distinction is subtle but important:
+
+- StarLang source semantics stay inside StarLang.
+- Generated Common Lisp APIs are consumers of the compiled contract.
+
+* 18. Normalized IR: the firewall between language and runtime
+
+The current normalized IR schema is =org.star-lang/normalized-ir@2=.
+
+The design rule is stronger than “IR happens to be a plist.” The IR should be:
+
+- deterministic;
+- data-only;
+- runtime-neutral;
+- stable enough for portable manifests/bindings;
+- independent of a specific transport or actor implementation.
+
+A bad IR addition would look conceptually like:
+
+#+begin_example
+(:operation :cl-gserver-cast ...)
+#+end_example
+
+because that hardcodes a particular runtime technology into the language contract.
+
+A better normalized representation describes the semantic intent -- actor message, capability, endpoint/port contract, lifecycle property, etc. -- and lets a runtime adapter map that intent onto Sento, RabbitMQ, HTTP, an external process, or another backend.
+
+This is the single most useful architectural constraint when deciding where new behavior belongs.
+
+* 19. Macros: expansion without opening the Lisp evaluator
+
+StarLang supports bounded declarative macros in declaration context. The macro system is designed around syntax objects and provenance rather than arbitrary compile-time Common Lisp execution.
+
+The high-level rules are:
+
+- macro definitions are collected before expansion;
+- imported macros retain locked library identity;
+- generated identifiers receive deterministic fresh scopes;
+- source/use-site/definition provenance is recorded;
+- expansion must not invoke the Common Lisp reader/evaluator as an escape hatch.
+
+If you extend macros, your checklist is:
+
+- Is expansion deterministic?
+- Is expansion bounded?
+- Are introduced identifiers hygienic?
+- Does the result carry origin/source metadata?
+- Can errors point back to both invocation and definition?
+- Are imported macro dependencies locked and recorded?
+- Does expansion still produce valid core syntax before compilation?
+
+Macro convenience is never worth turning =.star= into “Common Lisp with a thin wrapper.”
+
+* 20. The actor runtime mental model
+
+StarLang's runtime side is actor-oriented. The exact implementation is spread across transitional prototype files, but the useful conceptual flow is:
+
+#+begin_example
+compiled contract / actor manifest
+            |
+            v
+runtime directory / logical actor identity
+            |
+            v
+deterministic dispatcher
+            |
+            v
+per-actor mailbox / single-message handling
+            |
+            +----> journal / replay
+            |
+            +----> lease / ownership
+            |
+            +----> capability checks
+            |
+            +----> adapter ports
+                      |
+                      +--> HTTP
+                      +--> process
+                      +--> transport/remoting
+#+end_example
+
+Important implementation files include:
+
+- =prototype/actor-wire-prototype.lisp=;
+- =prototype/deterministic-dispatcher-prototype.lisp=;
+- =prototype/deferred-dispatch-completion-prototype.lisp=;
+- =prototype/dispatcher-idempotency-identity-prototype.lisp=;
+- =prototype/runtime-directory-prototype.lisp=;
+- =prototype/runtime-journal-port-prototype.lisp=;
+- =prototype/domain-remoting-lease-prototype.lisp=;
+- =prototype/transport-port-prototype.lisp=;
+- =prototype/dispatcher-transport-adapter-prototype.lisp=;
+- =prototype/cl-gserver-runtime-facade-prototype.lisp=.
+
+When debugging a lost actor message, follow those boundaries instead of staring only at the actor handler.
+
+* 21. Deterministic dispatch and idempotency
+
+Distributed actor systems get nasty when retries and duplicate delivery interact with side effects.
+
+The existence of explicit deterministic-dispatch and idempotency-identity components tells you the runtime is designed to make message handling/retries observable and repeatable rather than “just send a message and hope.”
+
+When adding a new dispatch path, identify:
+
+- message identity;
+- target identity;
+- ordering assumptions;
+- whether delivery may be retried;
+- how duplicate completion is recognized;
+- where journal entries are written;
+- where side effects cross an adapter boundary.
+
+A transport retry must not silently become a second logical command if the protocol says it is the same command.
+
+* 22. Journals, leases, and remoting
+
+Three concepts are easy to conflate.
+
+**Journal**
+
+Records durable events/state transitions needed for recovery/replay.
+
+**Lease**
+
+Represents time-bound ownership/authority over an actor or resource. Leases prevent two runtimes from both believing they own the same logical thing indefinitely.
+
+**Transport/remoting**
+
+Moves messages/state across runtime boundaries.
+
+A remote actor design should not use “the TCP connection is open” as a substitute for all three concepts. Connection state, ownership, and durable history are different facts.
+
+* 23. Sento / CL-GServer is behind a compatibility boundary
+
+The final system list includes =star-sento-compat=. In the prototype, inspect =cl-gserver-runtime-facade-prototype.lisp=.
+
+The correct dependency direction is:
+
+#+begin_example
+StarLang semantic/runtime interface
+            |
+            v
+Sento compatibility facade
+            |
+            v
+CL-GServer / concrete actor runtime operations
+#+end_example
+
+Not:
+
+#+begin_example
+StarLang normalized IR -> raw CL-GServer calls
+#+end_example
+
+That boundary lets the language/runtime semantics remain stable if the concrete actor machinery changes.
+
+* 24. Incoming service URIs
+
+There is currently a feature branch / PR adding logical service URIs of the form:
+
+#+begin_example
+star://domain:address:actor-name
+#+end_example
+
+Examples:
+
+#+begin_example
+star://quasar:localhost:user-hunt
+star://bbp:localhost:nmap
+#+end_example
+
+The purpose is to give actors/services stable logical identities independent of Sento, RabbitMQ, HTTP, or another transport.
+
+At the time this tutorial was authored, this is PR #14 rather than mainline. That means:
+
+- learn the main runtime-directory/dispatcher model first;
+- inspect =agent/star-service-uri= if working on the feature;
+- do not write mainline documentation as if =star://= dispatch is already released;
+- once merged, update this tutorial and the architecture node.
+
+The changed files in that work include service URI parsing plus actor-wire, runtime-directory, dispatcher, ASDF, and tests -- exactly the layers you would expect for a logical addressing feature.
+
+* 25. How to read the repository efficiently
+
+A productive reading order is:
+
+1. =README.md=
+2. =starlang-prototype.asd=
+3. =fixtures/bbp-domain.star=
+4. =prototype/core-surface-prototype.lisp=
+5. =prototype/macro-expander-prototype.lisp=
+6. =prototype/compiler-ir-prototype.lisp=
+7. =prototype/star-loader.lisp=
+8. =prototype/document-runtime.lisp=
+9. =prototype/document-runtime-tests.lisp=
+10. =prototype/actor-wire-prototype.lisp=
+11. =prototype/deterministic-dispatcher-prototype.lisp=
+12. =prototype/runtime-directory-prototype.lisp=
+13. journal/lease/remoting files
+14. =prototype/cl-gserver-runtime-facade-prototype.lisp=
+15. =prototype/star-lang-api.lisp=
+
+Why this order? You first learn the contract language, then the compiler boundary, then a concrete runtime consumer, then actor execution, then the public facade. Starting at the facade hides too much; starting deep in remoting gives you too many implementation details before the language model is clear.
+
+* 26. Debugging playbook
+
+**Case: valid-looking =.star= file fails immediately**
+
+Run =read-star-syntax= directly. Inspect the condition type, phase, line/column/span, and syntax kind. Verify parser limits were not exceeded.
+
+**Case: parser succeeds, compiler rejects generated declaration**
+
+Run expansion separately. Inspect the expanded syntax and origin chain. A macro-generated identifier may be scoped or introduced incorrectly.
+
+**Case: validation accepts nonsense**
+
+Find the core validator for that declaration kind. Add a negative test first. Validation should reject invalid language states before runtime loading.
+
+**Case: manifest field changed spelling**
+
+Check lower camelCase preservation and normalized IR. Do not blindly fix generated TypeScript/Python output first; they consume the portable manifest.
+
+**Case: documents receive unstable IDs**
+
+Check ID policy compilation and canonical input serialization. Re-run the map-order digest test.
+
+**Case: encoded documents differ between runs**
+
+Check canonical JSON/key ordering and exact decimal/float rules. Deterministic interchange is a compiler/runtime contract.
+
+**Case: actor command executes twice**
+
+Trace dispatcher identity, deferred completion, idempotency identity, journal writes, and transport retry behavior.
+
+**Case: remote actor appears alive but requests fail**
+
+Separate directory/liveness, lease ownership, transport connection, and journal state. They are not the same layer.
+
+* 27. Testing strategy for a language/runtime change
+
+For any nontrivial change, test at the narrowest layer *and* through the top-level contract.
+
+Example: adding a new scalar constraint.
+
+1. parser test -- syntax is represented correctly;
+2. validation tests -- legal/illegal forms;
+3. compiler test -- normalized IR contains the constraint deterministically;
+4. loader test -- a real =.star= fixture loads;
+5. runtime/document test -- constructed values obey the contract if runtime validation applies;
+6. ASDF full suite;
+7. Nix flake check.
+
+Example: adding actor addressing.
+
+1. parser/normalizer tests for address syntax;
+2. actor manifest tests;
+3. runtime directory exact-resolution tests;
+4. dispatcher routing tests;
+5. liveness/not-found failure tests;
+6. end-to-end actor dispatch fixture;
+7. full suite.
+
+Do not jump from unit parser tests to “works in my server” and call the language change done.
+
+* 28. Major project: build a BBP tool-run contract
+
+Now build something realistic: a small StarLang contract for dispatching a BBP-style scanner tool and storing its result.
+
+The production repository already has =fixtures/bbp-domain.star=. Your project is to recreate a smaller version from first principles, then compare it with the real fixture.
+
+**Step 1: define library identity**
+
+Create =learning-bbp.star=:
+
+#+begin_src lisp
+(spec-library "org.example/learning-bbp@1"
+  (:version "1.0.0")
+#+end_src
+
+Do not close the final parenthesis yet.
+
+**Step 2: define constrained IDs**
+
+#+begin_src lisp
+  (scalar program-id
+    (:base string
+     :pattern "^[a-z0-9][a-z0-9._:-]{2,127}$"))
+
+  (scalar run-id
+    (:base string
+     :pattern "^[a-z0-9][a-z0-9._:-]{2,127}$"))
+#+end_src
+
+**Step 3: define the tool and lifecycle enums**
+
+#+begin_src lisp
+  (enum tool-name
+    (subfinder httpx katana nmap))
+
+  (enum tool-run-status
+    (queued running completed failed cancelled))
+#+end_src
+
+**Step 4: define the stored run**
+
+#+begin_src lisp
+  (document tool-run
+    (:persistence persistent)
+    (runId run-id :required)
+    (programId program-id :required)
+    (tool tool-name :required)
+    (target string :required)
+    (argv (list string) :required)
+    (status tool-run-status :required)
+    (exitCode integer :optional)
+    (stdout string :optional)
+    (stderr string :optional)
+    (raw map :required))
+#+end_src
+
+**Step 5: define the command**
+
+#+begin_src lisp
+  (message run-tool
+    (:fields
+     ((programId program-id :required)
+      (runId run-id :required)
+      (tool tool-name :required)
+      (target string :required)
+      (options map :optional))))
+#+end_src
+
+**Step 6: define completion**
+
+#+begin_src lisp
+  (message tool-run-completed
+    (:fields
+     ((programId program-id :required)
+      (runId run-id :required)
+      (tool tool-name :required)
+      (target string :required)
+      (argv (list string) :required)
+      (exitCode integer :required)
+      (stdout string :required)
+      (stderr string :required)))))
+#+end_src
+
+That last parenthesis closes the library.
+
+**Step 7: load it**
+
+In SBCL with =starlang-prototype= loaded:
+
+#+begin_src lisp
+(defparameter *bbp-graph*
+  (star-lang.api:load-star-file #P"learning-bbp.star"))
+#+end_src
+
+If it fails, do not immediately edit randomly. Execute parser -> expansion -> validation -> compilation manually and identify the failing phase.
+
+**Step 8: add a document construction test**
+
+Construct a stored run:
+
+#+begin_src lisp
+(defparameter *run*
+  (star-lang.api:create-document
+   *bbp-graph*
+   "tool-run"
+   '(("runId" . "run-001")
+     ("programId" . "program-001")
+     ("tool" . nmap)
+     ("target" . "example.org")
+     ("argv" . ("nmap" "-sV" "example.org"))
+     ("status" . completed)
+     ("exitCode" . 0)
+     ("stdout" . "example output")
+     ("stderr" . "")
+     ("raw" . ()))
+   :dataset "learning-bbp"))
+#+end_src
+
+If the exact runtime representation for enum/list/map values differs from this literal in your current checkout, inspect =document-runtime-tests.lisp= and the compiler's type coercion path rather than weakening the contract. The point of the exercise is to follow the real runtime representation, not invent one.
+
+**Step 9: encode it**
+
+#+begin_src lisp
+(star-lang.api:encode-document *run* :key-style :camel :couchdb t)
+#+end_src
+
+Check that =runId=, =programId=, =exitCode= and other lower camelCase fields remain spelled exactly as declared.
+
+**Step 10: negative tests**
+
+Try each of these and expect rejection at the appropriate layer:
+
+- unknown tool enum value;
+- malformed run ID;
+- missing required target;
+- string instead of integer =exitCode=;
+- undeclared document field;
+- malformed message declaration.
+
+A contract language is mostly defined by what it refuses.
+
+**Step 11: compare with the real fixture**
+
+Open =fixtures/bbp-domain.star=. Identify what the production fixture adds:
+
+- program contract;
+- target contract;
+- tool observations;
+- register-program / program-registered messages;
+- program-state query/result;
+- import of StarIntel core.
+
+Then answer: which pieces are persistence, which are actor protocol, and which are shared domain types?
+
+* 29. Major project extension: design actor discovery without transport leakage
+
+After the first project, sketch how the BBP Nmap actor should be addressed.
+
+The incoming logical identity is:
+
+#+begin_example
+star://bbp:localhost:nmap
+#+end_example
+
+Your design should preserve this dependency direction:
+
+#+begin_example
+run-tool message
+   -> logical actor/service identity
+   -> runtime directory resolution
+   -> deterministic dispatcher
+   -> runtime actor
+   -> process adapter
+   -> nmap executable
+#+end_example
+
+Do *not* encode:
+
+#+begin_example
+run-tool -> RabbitMQ queue "whatever"
+#+end_example
+
+into the StarLang semantic contract. RabbitMQ might be one transport. The logical contract should survive swapping transports.
+
+When PR #14 lands, re-run this exercise against the actual service URI parser/manifest/runtime-directory implementation and compare your design to the code.
+
+* 30. Extending StarLang safely
+
+Suppose you want to add a new top-level declaration =capability-set=.
+
+A disciplined change would touch layers in this order:
+
+**1. Language design**
+
+Define exact syntax and semantics. Decide names, types, allowed contexts, normalization, errors, and compatibility.
+
+**2. Parser/syntax representation**
+
+Ensure the closed parser can represent the declaration while preserving spans/limits.
+
+**3. Macro behavior**
+
+Decide whether the form may be generated/consumed by declarative macros and preserve hygiene/provenance.
+
+**4. Core validation**
+
+Reject duplicate names, malformed entries, invalid references, wrong contexts, etc.
+
+**5. Normalized IR**
+
+Encode semantic data only. Do not leak a concrete authorization library call.
+
+**6. Portable manifest/bindings**
+
+If external consumers need the declaration, add it to the portable contract once, then update generators as consumers.
+
+**7. Runtime consumer**
+
+Map the capability declaration into =star-capability= or the appropriate runtime boundary.
+
+**8. Tests**
+
+Positive, negative, deterministic IR, generated manifest, runtime behavior, ASDF suite, Nix suite.
+
+This order prevents the classic mistake of implementing runtime behavior first and then reverse-engineering language semantics around whatever code happened to be easiest.
+
+* 31. Common mistakes
+
+**Mistake: “It looks like Lisp, so I can READ it.”**
+
+No. The closed parser is a security and semantic boundary.
+
+**Mistake: “The prototype is temporary, so I should implement only in final directories.”**
+
+Not necessarily. The repository explicitly says the authoritative implementation remains in =prototype/= until ownership can move cleanly without duplication/cycles/test loss.
+
+**Mistake: “Generated Python is another StarLang implementation.”**
+
+No. Generated Python/TypeScript consume portable contracts. Common Lisp owns parsing/compiler/runtime semantics.
+
+**Mistake: “A transport address is actor identity.”**
+
+No. Logical actor identity should survive transport changes.
+
+**Mistake: “If a test passes in my REPL, we're good.”**
+
+No. Fresh-process ASDF tests intentionally expose package/load-order contamination.
+
+**Mistake: “Canonical JSON is presentation formatting.”**
+
+No. Deterministic key order, number handling, and exact decimal representation affect hashing, reproducibility, manifests, and cross-language compatibility.
+
+**Mistake: “Compatibility means accept both field names forever everywhere.”**
+
+No. Normalize legacy input at an explicit boundary and emit canonical output.
+
+* 32. What to inspect next
+
+After completing this tutorial, read these source files with a debugger/REPL open:
+
+- =prototype/core-surface-prototype.lisp= -- syntax/error/parser foundation;
+- =prototype/macro-expander-prototype.lisp= -- expansion model;
+- =prototype/compiler-ir-prototype.lisp= -- lowering/IR;
+- =prototype/star-loader.lisp= -- library/import graph;
+- =prototype/document-runtime.lisp= -- runtime contracts/documents;
+- =prototype/document-runtime-tests.lisp= -- executable behavior examples;
+- =prototype/actor-wire-prototype.lisp= -- actor protocol representation;
+- =prototype/deterministic-dispatcher-prototype.lisp= -- dispatch behavior;
+- =prototype/runtime-directory-prototype.lisp= -- actor lookup/liveness boundary;
+- =prototype/runtime-journal-port-prototype.lisp= -- durability port;
+- =prototype/domain-remoting-lease-prototype.lisp= -- ownership/lease model;
+- =prototype/cl-gserver-runtime-facade-prototype.lisp= -- concrete actor runtime boundary;
+- =prototype/star-lang-api.lisp= -- public integration surface.
+
+Then read the real fixtures:
+
+- =fixtures/star-cl.star=;
+- =fixtures/starintel-core.star=;
+- =fixtures/bbp-domain.star=;
+- =fixtures/fec-core.star=.
+
+The fixtures are not filler. They show what the language currently has to express under real StarIntel-style contracts.
+
+* 33. Completion checklist
+
+You understand StarLang at a working level when you can do all of this without guessing:
+
+- [ ] Explain why =.star= input cannot go through Common Lisp =READ=.
+- [ ] Trace =read-star-syntax -> expand-star-syntax -> validate-star-core -> compile-star-core=.
+- [ ] Explain what information =star-syntax-to-datum= loses.
+- [ ] Write a versioned =spec-library=.
+- [ ] Lock an import by version and digest.
+- [ ] Define constrained scalars and closed enums.
+- [ ] Define persistent documents with required/optional fields.
+- [ ] Explain document inheritance and ID policies.
+- [ ] Define actor/protocol messages separately from documents.
+- [ ] Load a =.star= file through =STAR-LANG.API=.
+- [ ] Construct a document from an alist of source field names.
+- [ ] Encode/decode a document and preserve identity.
+- [ ] Explain deterministic digest IDs.
+- [ ] Explain why lower camelCase preservation matters.
+- [ ] Explain why normalized IR is runtime-neutral.
+- [ ] Trace a message through directory -> dispatcher -> actor/runtime boundaries.
+- [ ] Distinguish journal, lease, transport, and supervision responsibilities.
+- [ ] Explain why Sento/CL-GServer belongs behind a compatibility facade.
+- [ ] Run =asdf:test-system :starlang-prototype=.
+- [ ] Run =nix flake check -L=.
+- [ ] Recreate the small BBP contract project.
+- [ ] Read PR #14 before claiming =star://= service dispatch is mainline.
+
+* 34. Related Org-roam nodes
+
+- [[id:1111004a-95fd-488b-979b-e8433431e299][StarLang]]
+- [[id:dca7bf46-7062-4e34-bfaf-8bec6e520a42][StarLang Compiler and Runtime Architecture]]
+- [[id:c91d5283-f96e-4d95-92f6-a926ea6951f5][StarLang Spec Libraries and Portable Contracts]]
+- [[id:39d04aa8-7b66-4fa1-b25c-1fb724461793][GPT Org-roam Learning Graph]]
