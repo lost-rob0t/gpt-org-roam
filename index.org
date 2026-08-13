@@ -9,6 +9,7 @@
 
 * Tutorials
 - [[id:41d65192-9402-4597-940d-3fb304e6ebc9][StarLang from Zero to Advanced: Contracts, Actors, Service URIs, and Durable Runtime]]
+- [[id:efbd8078-67b9-4f9e-adcf-99d94338d289][Prolog-RLM Deep Dive: Building Bounded Recursive LLM Harnesses in SWI-Prolog]]
 
 * Architecture
 - [[id:dca7bf46-7062-4e34-bfaf-8bec6e520a42][StarLang Compiler and Runtime Architecture]]

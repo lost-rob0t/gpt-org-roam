@@ -1,0 +1,1775 @@
+:PROPERTIES:
+:ID:       efbd8078-67b9-4f9e-adcf-99d94338d289
+:END:
+#+title: Prolog-RLM Deep Dive: Building Bounded Recursive LLM Harnesses in SWI-Prolog
+#+author: lost-rob0t
+#+language: en-US
+#+filetags: :prolog:rlm:llm:agents:recursive-language-models:swi-prolog:tutorial:
+#+property: repo https://github.com/lost-rob0t/prolog-rlm
+#+property: source_ref main
+#+property: source_commit 52ca8060456a0e91b69783867d6733026b94d07e
+
+* Goal
+
+This tutorial starts with the research idea behind Recursive Language Models (RLMs), then maps that idea onto the current =prolog-rlm= implementation in SWI-Prolog.
+
+It is code-first and implementation-grounded. The important distinction is that an RLM is not a magical new set of model weights. It is a *harness architecture*: a model receives a task while large context remains in an external programmable environment, selectively inspects or transforms that context, and may launch bounded model calls over smaller derived contexts.
+
+The current =prolog-rlm= implementation pushes that idea further: the model chooses semantic strategy, but Prolog owns execution semantics, capability checks, budgets, cancellation, durable state, and traces.
+
+By the end you should be able to:
+
+- explain the original RLM architecture and the major 2026 follow-up directions;
+- distinguish depth, decomposition, external context, agents, and durable artifact handoff;
+- install and run =prolog-rlm= without a Python runtime;
+- use =llm_query/3=, =rlm_query/4=, and =rlm_completion/4= correctly;
+- inspect opaque contexts and execute typed plans without involving an LLM;
+- create capability-gated host tools without exposing arbitrary =call/1=;
+- understand shared token/cost/tool/context/depth/time budgets;
+- run depth 0/1/2 experiments and understand why depth >1 is still experimental;
+- build supervised logical agents and resumable graphs;
+- use durable artifacts as bounded cross-root memory;
+- understand the current code-review sharp edges rather than treating the repo as finished;
+- build a bounded repository-analysis RLM as a capstone.
+
+* 1. RLM does not mean "keep recursively prompting forever"
+
+The original RLM work reframes long-context inference as a computation problem.
+
+A conventional long-context call looks like:
+
+#+begin_example
+huge prompt + question
+        |
+        v
+   one model call
+        |
+        v
+      answer
+#+end_example
+
+An RLM instead looks like:
+
+#+begin_example
+question                         huge context
+   |                                  |
+   |                                  v
+   |                         external environment
+   |                                  |
+   v                                  |
+root model <---- inspect/search/slice/transform
+   |
+   +----> bounded child model call on selected material
+   |
+   +----> another deterministic context operation
+   |
+   +----> final synthesis
+#+end_example
+
+The key operation is *selective computation over context*. Recursion is one available operation, not the objective.
+
+That distinction matters because deeper recursion can increase latency and cost without increasing answer quality.
+
+* 2. Research background: the original Recursive Language Models paper
+
+The foundational paper is:
+
+- Alex L. Zhang, Tim Kraska, Omar Khattab, "Recursive Language Models", arXiv:2512.24601.
+- Paper: https://arxiv.org/abs/2512.24601
+- Reference implementation: https://github.com/alexzhang13/rlm
+- Minimal implementation: https://github.com/alexzhang13/rlm-minimal
+
+The paper's central move is to keep the long prompt outside the model and expose it through a programmable environment. The model can inspect the external prompt, write small programs that manipulate it, and recursively invoke language models over selected pieces.
+
+The original reference implementation uses a Python-style REPL environment. The model can interact with an external context variable and create sub-LM calls. That design proves the basic idea, but it also raises a systems question:
+
+#+begin_quote
+What execution language should an RLM be allowed to control?
+#+end_quote
+
+=prolog-rlm= answers that question with a closed symbolic plan language rather than unrestricted model-generated source execution.
+
+* 3. Minimal RLM: understand depth 1 first
+
+The official =rlm-minimal= repository deliberately demonstrates depth 1. That is useful pedagogically because most of the RLM value proposition appears before you build an arbitrarily deep recursion tree.
+
+At depth 1:
+
+#+begin_example
+root reasoning
+   |
+   +--> inspect external context
+   |
+   +--> select bounded subcontext
+   |
+   +--> one child model call
+   |
+   `--> synthesize
+#+end_example
+
+You already gain:
+
+- separation between context storage and model prompt;
+- selective inspection;
+- explicit decomposition;
+- a place to account for cost;
+- a traceable parent/child boundary.
+
+Depth 2 is not automatically "twice as smart". It is another execution strategy that needs evidence.
+
+* 4. 2026 result: recursion can overthink
+
+"Think, But Don't Overthink: Reproducing Recursive Language Models" (arXiv:2603.02615) is an important counterweight to naive recursion enthusiasm:
+
+https://arxiv.org/abs/2603.02615
+
+The useful lesson for harness design is simple:
+
+#+begin_example
+more recursive depth
+      !=
+more useful reasoning
+#+end_example
+
+A deeper tree can add model calls, wall time, and failure surfaces. A production harness therefore needs a routing policy and a stopping policy, not merely a numeric =max_depth= knob.
+
+This is why =prolog-rlm= keeps production recursion at depth 1 and places depth >1 behind an explicit experiment gate.
+
+* 5. SRLM: search over context programs, not only answers
+
+The SRLM work ("Recursive Language Models Meet Uncertainty: Self-Reflective Program Search for Adaptive Long-Context Reasoning", arXiv:2603.15653) treats the program used to process context as an object of search:
+
+https://arxiv.org/abs/2603.15653
+
+That suggests an RLM harness can reason about competing strategies:
+
+#+begin_example
+candidate A: deterministic search
+candidate B: slice + cheap submodel
+candidate C: recursive RLM
+candidate D: delegated agent
+candidate E: direct continuation
+#+end_example
+
+The routing question is therefore closer to:
+
+#+begin_quote
+Which bounded computation has the highest expected utility per unit cost?
+#+end_quote
+
+than to:
+
+#+begin_quote
+How deep can I recurse?
+#+end_quote
+
+The =prolog-rlm= adaptive recursion modules embody this direction with explicit route candidates and duplicate/no-progress guards.
+
+* 6. lambda-RLM: typed control is a first-class design problem
+
+=lambda-RLM= (arXiv:2603.20105) replaces a free-form REPL with a typed functional runtime:
+
+https://arxiv.org/abs/2603.20105
+
+This is highly relevant to =prolog-rlm=. Once an LLM is allowed to control computation, the host runtime must decide:
+
+- what operations exist;
+- what arguments they accept;
+- what authority each operation requires;
+- how execution terminates;
+- how resource usage is bounded;
+- how failures are represented.
+
+In =prolog-rlm=, that role is played by a closed plan AST plus capability and budget validation.
+
+The model can choose *what* to do without being handed unrestricted Prolog execution.
+
+* 7. Recursive Agent Harnesses: recurse over a harness, not merely a raw model
+
+"Recursive Agent Harnesses" (arXiv:2606.13643) broadens the recursive unit from a plain LM call to an agent harness:
+
+https://arxiv.org/abs/2606.13643
+
+That distinction is useful when a child needs its own:
+
+- lifecycle;
+- mailbox;
+- failure status;
+- cancellation;
+- scoped capabilities;
+- checkpoints;
+- durable state.
+
+=prolog-rlm= therefore supports both nested typed =rlm(...)= execution and supervised logical agents. They solve related but different problems.
+
+* 8. Chained RLMs and fresh reasoning roots
+
+"Chained Recursive Language Models for Multi-Iteration Reasoning" (arXiv:2608.05124) emphasizes continuing work through compact state rather than carrying an ever-growing transcript:
+
+https://arxiv.org/abs/2608.05124
+
+This maps naturally onto =prolog-rlm='s artifact subsystem:
+
+#+begin_example
+root A
+  |
+  +--> evidence
+  +--> compact summary
+  `--> durable artifact
+              |
+              v
+            root B
+              |
+              `--> receives selected artifact state
+#+end_example
+
+This is a different axis from recursive depth. You can terminate one reasoning root and start a fresh one with bounded durable state.
+
+* 9. Harnesses as compositional generalizers
+
+Alex Zhang's 2026 essay "Language model harnesses are compositional generalizers" argues that a good harness creates locally manageable observations and lets the model compose reusable reasoning patterns over them:
+
+https://alexzhang13.github.io/blog/2026/harness/
+
+For =prolog-rlm=, that means the harness should make operations such as =search=, =slice=, =tool=, =model=, =rlm=, =checkpoint=, and artifact retrieval small, explicit, inspectable units.
+
+The harness should remove irrelevant global complexity without hiding the execution contract.
+
+* 10. Map the research onto prolog-rlm
+
+Here is the conceptual correspondence:
+
+#+begin_example
+RLM research concept              prolog-rlm mechanism
+--------------------              -------------------
+external context                  rlm_context opaque handles
+context program                   typed plan AST
+sub-LM call                       model(...) plan step
+recursive LM call                 rlm(...) plan step
+bounded host action               capability-gated tool
+adaptive decomposition            rlm_recursion_policy
+agent-harness recursion           rlm_agent
+fresh-root handoff                rlm_artifact
+long-running workflow             rlm_graph
+runtime accounting                shared budgets + usage
+observability                     structured transitions + rlm_trace
+interop tools/resources           rlm_mcp
+#+end_example
+
+This is the architectural thesis of the repository:
+
+#+begin_quote
+The language model chooses semantic strategy; Prolog owns execution semantics.
+#+end_quote
+
+* 11. Review baseline: what was inspected
+
+This tutorial was checked against =lost-rob0t/prolog-rlm= =main= at commit:
+
+#+begin_example
+52ca8060456a0e91b69783867d6733026b94d07e
+#+end_example
+
+The review inspected the public facade, completion runtime, deep-recursion experiment documentation, tests/benchmarks, current issues, and current CI state.
+
+At this commit:
+
+- deterministic module loading passes;
+- deterministic PlUnit passes;
+- deterministic benchmark/conformance passes;
+- the deterministic depth >1 experiment passes;
+- CLI/demo trace smoke passes;
+- persistent graph resume passes across fresh SWI processes;
+- durable artifact handoff passes across fresh SWI processes.
+
+The live OpenRouter lane was red on August 13, 2026 for a provider-routing reason discussed below.
+
+* 12. Current code-review findings
+
+The architecture is strong enough to teach, but it is not finished. Four edges matter when you build on it.
+
+**Finding A: =rlm_query/4= does not automatically expose opaque context bytes**
+
+The current implementation obtains metadata for the supplied subcontext, then asks the model to answer while explicitly saying the metadata is not context content.
+
+So this:
+
+#+begin_src prolog
+rlm_query(
+    "What secret token is inside?",
+    text("secret token = ORANGE_42"),
+    [depth(1)],
+    Outcome).
+#+end_src
+
+must not be mentally modeled as "the child automatically reads the text." For real context-directed reasoning, use =rlm_completion/4= with context operations or explicitly pass selected material to a model step.
+
+**Finding B: recursive-plan fingerprints have a known Prolog term edge**
+
+Issue #42 tracks anonymous-tag SWI dicts interacting badly with the current direct =term_hash/2= recursive fingerprint path. A false cycle can be reported for structurally distinct nested plans.
+
+https://github.com/lost-rob0t/prolog-rlm/issues/42
+
+Do not weaken cycle detection to fix this. Canonicalize before fingerprinting.
+
+**Finding C: failed plan execution can lose provider usage at the completion boundary**
+
+Issue #44 tracks the error path. The success path aggregates the append-only model-response ledger; =completion_after_execution(error(...))= currently returns immediately, so provider tokens/cost spent before a later failure can be omitted from the final completion error.
+
+https://github.com/lost-rob0t/prolog-rlm/issues/44
+
+If you are doing cost-sensitive production work, treat failure-path usage accounting as an active sharp edge.
+
+**Finding D: nested trajectory reconstruction is not yet an authoritative call tree**
+
+Issue #45 tracks the fact that completion trajectory events are reconstructed from the top-level plan and final lexical variables. Nested variables can disappear when child scope is restored, so intermediate calls or their true depths can be missing.
+
+https://github.com/lost-rob0t/prolog-rlm/issues/45
+
+The right long-term direction is to consume the append-only execution event ledger rather than infer events from final scope.
+
+* 13. Live-provider CI hazard: =openrouter/free= is a router
+
+The latest reviewed live CI run used =openrouter/free=. One streaming acceptance request was routed to a content-safety model. The HTTP request succeeded, but the returned text did not contain the test's requested sentinel token.
+
+That is a real reproducibility lesson:
+
+#+begin_example
+"HTTP 200 from OpenRouter"
+          !=
+"same underlying model handled every test"
+#+end_example
+
+For smoke testing provider connectivity, =openrouter/free= is convenient.
+
+For deterministic acceptance semantics, pin =OPENROUTER_TEST_MODEL= to a known suitable model rather than assuming a free router alias has stable behavior.
+
+Do not replace the live lane with fakes. Deterministic model doubles belong in deterministic tests; the live lane should stay genuinely live.
+
+* 14. Get the runtime running
+
+The documented baseline is SWI-Prolog 9.0 or newer.
+
+#+begin_src sh
+git clone https://github.com/lost-rob0t/prolog-rlm
+cd prolog-rlm
+swipl --version
+#+end_src
+
+Load checks:
+
+#+begin_src sh
+swipl -q -s test/check_runtime.pl
+swipl -q -s test/load_all.pl
+#+end_src
+
+Full deterministic suite:
+
+#+begin_src sh
+swipl -q -s test/run_tests.pl
+#+end_src
+
+Credential-free runtime demo:
+
+#+begin_src sh
+swipl -q -s bin/prolog-rlm.pl -- demo
+#+end_src
+
+The production library entrypoint is:
+
+#+begin_src prolog
+:- use_module('prolog/rlm').
+#+end_src
+
+Smoke it from a REPL:
+
+#+begin_src prolog
+?- use_module('prolog/rlm').
+true.
+
+?- rlm_version(V).
+V = '0.1.0-dev'.
+
+?- rlm_ready.
+true.
+#+end_src
+
+The current repo does not ship a =flake.nix=, so this tutorial does not invent one.
+
+* 15. Public module map
+
+The facade =prolog/rlm.pl= exports the high-level surface. Internally, the important namespaces are:
+
+#+begin_example
+rlm
+ |
+ +--> rlm_chain             provider/model abstraction
+ +--> rlm_context           opaque bounded context
+ +--> rlm_plan              closed plan AST + interpreter
+ +--> rlm_tool              capabilities + trusted tools
+ +--> rlm_completion        root supervisor
+ +--> rlm_recursion_policy  adaptive route selection
+ +--> rlm_recursion_runtime route execution
+ +--> rlm_deep_experiment   depth 0/1/2 experiment gate
+ +--> rlm_outcome           structured failure/inspection/repair
+ +--> rlm_agent             supervised logical agents
+ +--> rlm_graph             durable state graphs
+ +--> rlm_artifact          versioned durable artifacts
+ +--> rlm_mcp               canonical MCP boundary
+ +--> rlm_benchmark         evaluation
+ +--> rlm_trace             JSON/JSONL trace export
+ +--> rlm_cli               command facade
+#+end_example
+
+Start with context and plans before agents or MCP. Those two modules define the fundamental execution boundary.
+
+* 16. Opaque context: the core RLM data boundary
+
+Import the lower-level context runtime when you want to test it directly:
+
+#+begin_src prolog
+:- use_module('prolog/rlm_context').
+#+end_src
+
+Register text:
+
+#+begin_src prolog
+?- context_register(
+       text("alpha\nbeta needle\ngamma\nneedle delta\n"),
+       [],
+       ok(Ref)),
+   get_dict(handle, Ref, Handle).
+#+end_src
+
+Or Prolog terms:
+
+#+begin_src prolog
+?- context_register(
+       terms([
+           person(alice),
+           person(bob),
+           relation(alice, bob)
+       ]),
+       [],
+       ok(Ref)).
+#+end_src
+
+The handle is the authority to *refer to* the context. It is not an instruction to dump all payload bytes into the next model prompt.
+
+The memory backend deliberately does not treat =file(Path)= or =url(URL)= as ambient filesystem/network authority.
+
+* 17. Context operations are a closed vocabulary
+
+With a registered =Handle=:
+
+#+begin_src prolog
+?- context_peek(Handle, head(12), [], Peek).
+?- context_slice(Handle, 6, 20, [], Slice).
+?- context_search(Handle, "needle", [], Search).
+?- context_partition(Handle, lines(2), [], Parts).
+?- context_map(Handle, lowercase, [], Lower).
+?- context_reduce(Handle, count, [], Count).
+?- context_trace(Handle, 20, Trace).
+#+end_src
+
+The important systems property is not convenience. It is closure.
+
+A model can request one of the allowed transforms. It cannot inject =user:whatever_predicate= into =context_map/4= and thereby turn a data operation into arbitrary execution.
+
+Default context-operation bounds documented by the runtime include:
+
+#+begin_src prolog
+[max_results(32), max_bytes(16384), time_limit(0.25)]
+#+end_src
+
+Bound the *result* of inspection as carefully as the stored context itself.
+
+* 18. Typed plans are the execution language
+
+The plan runtime's public shape is:
+
+#+begin_src prolog
+plan_parse(+ModelOutput, -Outcome).
+plan_normalize(+PlanLike, -Outcome).
+plan_validate(+Plan, +Capabilities, +Budget, -Outcome).
+plan_execute(+ValidatedPlan, +RuntimeOptions, +Inputs, -Outcome).
+plan_run(+PlanLike, +Capabilities, +RuntimeOptions, +Inputs, -Outcome).
+#+end_src
+
+The core executable forms are:
+
+#+begin_src prolog
+context(HandleExpr, Action, Bind).
+model(ProviderName, PromptExpr, RequestOptions, Bind).
+rlm(SubPlan, Bind).
+tool(ToolName, ArgsExpr, Bind).
+parallel(SubPlans, Bind).
+retry(Attempts, SubPlan, Bind).
+checkpoint(Label).
+final(ValueExpr).
+#+end_src
+
+Expressions are also closed:
+
+#+begin_src prolog
+literal(Value).
+input(Name).
+var(Name).
+field(BaseExpr, Key).
+list(Exprs).
+object(KeyExprPairs).
+#+end_src
+
+That is the lambda-RLM-style lesson implemented in a Prolog-native way: model-generated control is parsed as data and validated before execution.
+
+* 19. Execute a deterministic context plan before adding an LLM
+
+Assume =Handle= is already registered:
+
+#+begin_src prolog
+Plan = plan([
+    context(input(context), search("needle"), hits),
+    final(var(hits))
+]),
+Caps = [context(search)],
+Inputs = _{context:Handle},
+plan_run(Plan, Caps, [], Inputs, Outcome).
+#+end_src
+
+This is one of the best debugging techniques in the repo.
+
+Separate three questions:
+
+1. Is the context operation correct?
+2. Is the symbolic plan valid?
+3. Can the model reliably choose the plan?
+
+Do not tune prompts to compensate for a broken deterministic execution layer.
+
+* 20. Whole-plan validation should fail before side effects
+
+Validation checks include:
+
+- known AST operations only;
+- correct binding/use order;
+- final result placement;
+- capability requirements;
+- nested plan validity;
+- static budget ceilings;
+- provider/tool preflight where possible.
+
+The intended invariant is:
+
+#+begin_quote
+If a plan is structurally or authoritatively impossible, reject it before performing partial side effects.
+#+end_quote
+
+That gives a model freedom over strategy without giving it freedom over authority.
+
+* 21. Capabilities are executable authority
+
+Typical capability terms include:
+
+#+begin_src prolog
+context(search).
+context(slice).
+model(openrouter).
+tool(project_read).
+rlm.
+parallel.
+retry.
+checkpoint.
+filesystem(read).
+network(http).
+process(exec).
+mcp(tools).
+#+end_src
+
+A child may narrow authority but may not widen it:
+
+#+begin_src prolog
+?- use_module('prolog/rlm_tool').
+?- capabilities_narrow(
+       [rlm, model(openrouter), tool(project_read)],
+       [model(openrouter)],
+       Outcome).
+#+end_src
+
+The reverse should fail:
+
+#+begin_src prolog
+?- capabilities_narrow(
+       [model(openrouter)],
+       [model(openrouter), tool(project_read)],
+       Outcome).
+#+end_src
+
+This rule must remain true at every recursive and agent boundary.
+
+* 22. Build a trusted tool without exposing arbitrary Prolog
+
+A tool registry separates model-visible schema from host-trusted implementation.
+
+#+begin_src prolog
+tool_registry_create(Registry).
+tool_register(Registry, Schema, Handler, Outcome).
+tool_discover(Registry, Schemas).
+tool_invoke(Registry, Caps, Name, Args, Options, Outcome, Trace).
+tool_registry_destroy(Registry).
+#+end_src
+
+Example pure host tool:
+
+#+begin_src prolog
+count_text(Args, Count) :-
+    get_dict(text, Args, Text),
+    string_length(Text, Count).
+
+count_text_schema(
+    tool_schema{
+        name:count_text,
+        description:"Count characters in a string",
+        capability:tool(count_text),
+        arguments:_{
+            type:object,
+            required:[text],
+            additional_properties:false,
+            properties:_{text:_{type:string}}
+        },
+        result:_{type:integer},
+        limits:tool_limits{
+            time_limit:1.0,
+            max_output_bytes:1024
+        }
+    }).
+#+end_src
+
+Register and invoke it:
+
+#+begin_src prolog
+tool_registry_create(Registry),
+count_text_schema(Schema),
+tool_register(Registry, Schema, user:count_text, ok(_)),
+tool_invoke(
+    Registry,
+    [tool(count_text)],
+    count_text,
+    _{text:"prolog"},
+    [],
+    Outcome,
+    Trace).
+#+end_src
+
+The model selects =count_text=. It never supplies =user:count_text= as executable code.
+
+* 23. The built-in project_read tool is a useful security example
+
+The repo includes a deliberately narrow project reader:
+
+#+begin_src prolog
+register_project_read_tool(
+    Registry,
+    '/srv/project',
+    [max_file_bytes(8192), time_limit(1.0)],
+    Outcome).
+#+end_src
+
+It requires:
+
+#+begin_src prolog
+tool(project_read)
+#+end_src
+
+It is designed to read one regular UTF-8 file under the configured root while rejecting traversal and path forms that escape the boundary.
+
+Do not replace that pattern with a generic "shell" tool just because it is easier. The whole point is to make authority semantically narrow.
+
+* 24. Provider layer: direct OpenRouter and compatible endpoints
+
+Import the provider layer:
+
+#+begin_src prolog
+:- use_module('prolog/rlm_chain').
+#+end_src
+
+OpenRouter provider:
+
+#+begin_src prolog
+openrouter_provider('openrouter/free', Provider).
+#+end_src
+
+The provider stores an environment credential reference instead of embedding the resolved secret in normal runtime terms.
+
+Live use:
+
+#+begin_src sh
+export OPENROUTER_API_KEY='...'
+#+end_src
+
+A direct model request:
+
+#+begin_src prolog
+openrouter_provider('openrouter/free', Provider),
+Request = model_request{
+    messages:[message{role:user, content:"Reply with OK."}],
+    options:_{max_tokens:32}
+},
+model_complete(Provider, Request, Outcome).
+#+end_src
+
+For stable test semantics, prefer a pinned suitable model over =openrouter/free=.
+
+* 25. =llm_query/3=, =rlm_query/4=, and =rlm_completion/4=
+
+These APIs are related but not interchangeable.
+
+**Direct bounded model call**
+
+#+begin_src prolog
+llm_query(
+    "Reply with OK.",
+    [budget(_{max_total_tokens:256, max_cost_usd:0.05})],
+    Outcome).
+#+end_src
+
+Use this when no RLM machinery is required.
+
+**Recursive subquery facade**
+
+#+begin_src prolog
+rlm_query(
+    "Summarize the child task.",
+    text("child context"),
+    [depth(1), budget(_{max_recursion_depth:1})],
+    Outcome).
+#+end_src
+
+Remember the current opaque-context caveat from the review: this API does not automatically insert the context payload into the model prompt.
+
+**Full RLM supervisor**
+
+#+begin_src prolog
+rlm_completion(Query, Context, Options, Outcome).
+#+end_src
+
+That path gives the planner a context handle/metadata and lets it choose validated context/model/tool/recursive operations.
+
+* 26. The full completion control flow
+
+At a high level:
+
+#+begin_example
+rlm_completion/4
+   |
+   +--> validate options + deep-recursion public gate
+   +--> acquire/register context
+   +--> fetch context metadata
+   +--> choose provider
+   +--> normalize root + child capabilities
+   +--> build planner prompt
+   +--> planner model call
+   +--> parse typed plan
+   +--> validate recursive tree
+   +--> bound plan model tokens
+   +--> execute plan
+   +--> aggregate usage
+   +--> produce completion_result + trajectory
+#+end_example
+
+The planner is not the executor. That separation is the main security and reliability boundary.
+
+* 27. Completion budgets are shared control state
+
+The current default completion budget is:
+
+#+begin_src prolog
+completion_budget{
+    max_iterations:32,
+    max_recursion_depth:1,
+    max_concurrent_subcalls:2,
+    max_model_calls:4,
+    max_tool_calls:4,
+    max_context_ops:8,
+    max_total_tokens:8192,
+    max_cost_usd:0.25,
+    max_output_bytes:32768,
+    time_limit:30.0
+}.
+#+end_src
+
+A recursive child does not get a fresh infinite budget.
+
+Think in terms of one shared execution tree:
+
+#+begin_example
+root planner call -----------+
+root model step              |
+child model step             |--> same global ceilings
+context operation            |
+tool operation               |
+retry                        |
+-----------------------------+
+#+end_example
+
+Static plan estimates happen before execution where possible; provider token/cost data can only be fully known after the provider reports it.
+
+* 28. Cancellation is part of correctness
+
+Create a token:
+
+#+begin_src prolog
+rlm_cancellation_token(Token).
+#+end_src
+
+Pass it in options:
+
+#+begin_src prolog
+[cancel_token(Token)]
+#+end_src
+
+Cancel from a controlling path:
+
+#+begin_src prolog
+rlm_cancel(Token).
+#+end_src
+
+Cancellation is not just a UI feature. A recursive harness that cannot terminate descendant work reliably does not have a trustworthy resource model.
+
+The depth >1 acceptance work specifically tests cancellation reaching nested work.
+
+* 29. Production depth is 1; depth >1 has a public opt-in gate
+
+The current public facade =prolog/rlm.pl= checks requested depth before invoking the internal completion runtime.
+
+This is accepted:
+
+#+begin_src prolog
+rlm_completion(
+    Query,
+    Context,
+    [budget(_{max_recursion_depth:1})],
+    Outcome).
+#+end_src
+
+This is rejected by the public gate:
+
+#+begin_src prolog
+rlm_completion(
+    Query,
+    Context,
+    [budget(_{max_recursion_depth:2})],
+    Outcome).
+#+end_src
+
+Depth >1 requires explicit opt-in:
+
+#+begin_src prolog
+rlm_completion(
+    Query,
+    Context,
+    [ experimental_deep_recursion(true),
+      budget(_{max_recursion_depth:2})
+    ],
+    Outcome).
+#+end_src
+
+The flag grants *no capability*. It only acknowledges that you are entering the experimental path.
+
+* 30. Adaptive recursion has its own policy gates
+
+The adaptive policy can choose routes such as:
+
+- =direct_continuation=;
+- =deterministic_context=;
+- =cheap_submodel=;
+- =recursive_rlm=;
+- =delegated_subagent=.
+
+Example signal set:
+
+#+begin_src prolog
+Signals = _{
+    task_complexity:0.8,
+    context_chars:180000,
+    uncertainty:0.7,
+    branch_diversity:0.3,
+    progress:1.0,
+    duplicate:false,
+    current_depth:0,
+    remaining_calls:4,
+    remaining_tokens:8000,
+    deterministic_context_available:true,
+    cheap_submodel_available:false,
+    delegated_subagent_available:false,
+    artifact_context_available:true
+},
+recursion_route(Signals, [], Outcome).
+#+end_src
+
+The adaptive policy's deeper routing remains independently gated. Do not confuse its policy flags with the public facade's =experimental_deep_recursion(true)= acknowledgement.
+
+* 31. Duplicate/no-progress detection
+
+A recursion router should reject repeated work rather than blindly consuming depth.
+
+The public recursion helpers include:
+
+#+begin_src prolog
+recursion_fingerprint(Subject, Fingerprint).
+recursion_guard(
+    Fingerprint,
+    PreviousFingerprints,
+    Progress,
+    Options,
+    Outcome).
+#+end_src
+
+This is where issue #42 matters: fingerprints must be canonical enough that representation-level Prolog details do not create false cycles.
+
+A good guard distinguishes:
+
+#+begin_example
+same problem + no progress     -> stop or reroute
+same broad task + new evidence -> may continue
+new subproblem                 -> may recurse
+#+end_example
+
+* 32. Run the deterministic depth 0/1/2 experiment
+
+The repo now has a dedicated deep-recursion experiment harness.
+
+Run it:
+
+#+begin_src sh
+swipl -q -s benchmark/run.pl -- deep-experiment
+#+end_src
+
+Write JSON:
+
+#+begin_src sh
+swipl -q -s benchmark/run.pl -- deep-experiment /tmp/deep-recursion.json
+#+end_src
+
+From Prolog:
+
+#+begin_src prolog
+?- use_module('prolog/rlm').
+?- deep_experiment_run(
+       [experimental_deep_recursion(true)],
+       Outcome).
+#+end_src
+
+Calling the experiment without the explicit flag fails closed.
+
+The deterministic fixture's synthetic quality/cost numbers test classification logic. They are not real provider economics.
+
+* 33. Run the real OpenRouter depth experiment
+
+With a credential:
+
+#+begin_src sh
+export OPENROUTER_API_KEY='...'
+swipl -q -s benchmark/run.pl -- deep-integration
+#+end_src
+
+Or save the report:
+
+#+begin_src sh
+swipl -q -s benchmark/run.pl \
+  -- deep-integration \
+  /tmp/deep-openrouter.json
+#+end_src
+
+The experiment compares fixed typed plans at depth 0, 1, and 2. The local fixed planner itself does not add a network call; the measured provider calls are the model steps inside the recursion tree.
+
+Measure:
+
+- actual provider calls;
+- prompt/completion/total tokens;
+- provider-reported cost;
+- wall latency;
+- selected model;
+- HTTP status;
+- actual depth;
+- usable assistant output;
+- acceptance-token behavior.
+
+One run is a sample, not a promotion decision.
+
+* 34. Promotion rule for depth >1
+
+The current default promotion evidence requires all of these:
+
+#+begin_example
+live trials                 >= 20
+independent fixtures        >= 3
+quality delta               >= +0.05
+cost ratio vs baseline      <= 1.50
+latency ratio vs baseline   <= 2.00
+budget violations           == 0
+capability violations       == 0
+cancellation failures       == 0
+#+end_example
+
+Example:
+
+#+begin_src prolog
+Evidence = promotion_evidence{
+    live_trials:24,
+    independent_fixtures:4,
+    quality_delta:0.08,
+    cost_ratio:1.30,
+    latency_ratio:1.60,
+    budget_violations:0,
+    capability_violations:0,
+    cancellation_failures:0
+},
+deep_experiment_promotion(Evidence, Decision).
+#+end_src
+
+The decision does not silently mutate production settings. It is evidence for a later architectural decision.
+
+* 35. Three recursive composition strategies
+
+The deep experiment compares more than nested =rlm(...)=.
+
+**Nested RLM**
+
+Use when a child is naturally part of one bounded symbolic plan tree.
+
+#+begin_example
+plan
+ |
+ +--> model
+ +--> rlm(child plan)
+ `--> final
+#+end_example
+
+**Delegated subagent**
+
+Use when work needs independent lifecycle/supervision/mailbox/cancellation semantics.
+
+#+begin_example
+supervisor
+ |
+ +--> child agent
+ |      +--> mailbox
+ |      +--> own state
+ |      `--> narrowed capabilities
+ `--> observe child status
+#+end_example
+
+**Fresh-root artifact handoff**
+
+Use when the correct boundary is "finish this reasoning root, persist selected state, start another root."
+
+#+begin_example
+root A -> artifact store -> root B
+#+end_example
+
+These are architectural alternatives, not just three spellings of recursion.
+
+* 36. Supervised logical agents
+
+The agent runtime uses SWI engines/state machines with finite queues and bounded workers instead of mapping every logical agent to a permanently blocked OS thread.
+
+Lifecycle surface:
+
+#+begin_src prolog
+agent_runtime_create(+Options, -Runtime).
+agent_runtime_destroy(+Runtime).
+agent_runtime_status(+Runtime, -Status).
+agent_spawn(+Runtime, +Parent, +Spec, +Capabilities, -Outcome).
+agent_send(+Runtime, +Agent, +Message, +Options, -Outcome).
+agent_pump(+Runtime, +Agent, +Options, -Outcome).
+agent_status(+Runtime, +Agent, -Outcome).
+agent_children(+Runtime, +Agent, -Children).
+agent_cancel(+Runtime, +Agent, +Reason, -Outcome).
+agent_trace(+Runtime, -Events).
+#+end_src
+
+Minimal capability-narrowing tree:
+
+#+begin_src prolog
+run_agents :-
+    setup_call_cleanup(
+        agent_runtime_create(
+            [root_capabilities([
+                 tool(spawn_agent),
+                 tool(read)
+             ])],
+            Runtime),
+        (
+            agent_spawn(
+                Runtime,
+                none,
+                agent_spec(root),
+                [tool(spawn_agent), tool(read)],
+                ok(Root)),
+            agent_spawn(
+                Runtime,
+                Root,
+                agent_spec(child),
+                [tool(read)],
+                ok(Child)),
+            agent_children(Runtime, Root, Children),
+            format('root=~q child=~q children=~q~n',
+                   [Root, Child, Children])
+        ),
+        agent_runtime_destroy(Runtime)).
+#+end_src
+
+The child must not regain a capability removed by its parent.
+
+* 37. Mailboxes and bounded worker pools
+
+The runtime uses a closed mailbox vocabulary around messages such as:
+
+#+begin_src prolog
+request(RunId, CallId, Work).
+result(CallId, Result).
+spawn(Parent, Child, Spec, Capabilities).
+cancel(RunId, Reason).
+checkpoint(RunId, Label).
+budget_exhausted(RunId, Kind).
+#+end_src
+
+Finite queues make overload observable as backpressure instead of invisible memory growth.
+
+Blocking provider/tool work belongs in a bounded worker pool configured with options such as:
+
+#+begin_src prolog
+worker_count(2).
+worker_backlog(8).
+worker_handler(my_module:worker_handler).
+#+end_src
+
+This is an actor-like architecture: logical agents own state and messages; scarce blocking execution is separately bounded.
+
+* 38. Graph runtime: explicit long-running orchestration
+
+A graph is declarative state + nodes + edges. Trusted executable handlers live outside the graph data.
+
+Tiny graph:
+
+#+begin_src prolog
+increment(_State, _Context, update(_{count:1})).
+
+run_graph(Outcome) :-
+    Spec = graph(
+        counter,
+        [field(count, integer, 0, sum)],
+        [node(increment, increment_handler)],
+        [edge(start, increment),
+         edge(increment, end)]
+    ),
+    Registry = [
+        handler(increment_handler, user:increment)
+    ],
+    graph_compile(Spec, Registry, [], ok(Compiled)),
+    graph_run(Compiled, _{}, [], Outcome).
+#+end_src
+
+Compilation validates graph structure before execution. Runtime loops remain bounded by total steps and visit limits.
+
+* 39. Checkpoint, interrupt, resume
+
+Open a memory backend:
+
+#+begin_src prolog
+graph_backend_open(memory, Backend).
+#+end_src
+
+A node may interrupt:
+
+#+begin_src prolog
+interrupt(needs_approval, _{status:waiting}).
+#+end_src
+
+Run with stable identity:
+
+#+begin_src prolog
+graph_run(
+    Compiled,
+    _{},
+    [backend(Backend), run_id(review_42)],
+    ok(Paused)).
+#+end_src
+
+Resume later:
+
+#+begin_src prolog
+graph_resume(
+    Compiled,
+    Backend,
+    review_42,
+    approved,
+    [],
+    Outcome).
+#+end_src
+
+Persistent backend:
+
+#+begin_src prolog
+graph_backend_open(
+    persist('/var/lib/my-app/graph.db'),
+    Backend).
+#+end_src
+
+The repository tests resume across fresh SWI processes, which is the right standard for durability claims.
+
+* 40. Durable artifacts: selected memory, not transcript replay
+
+Keep these concepts separate:
+
+#+begin_example
+provider transcript
+  -> one model interaction history
+
+graph checkpoint
+  -> execution state required to resume
+
+artifact
+  -> selected durable knowledge for later roots/agents
+#+end_example
+
+Open a store:
+
+#+begin_src prolog
+artifact_store_open(memory, ok(Store)).
+#+end_src
+
+Publish a version:
+
+#+begin_src prolog
+artifact_put(
+    Store,
+    [project, demo],
+    working_summary,
+    summary,
+    _{text:"bounded durable state"},
+    _{producer:manual_tutorial},
+    Outcome).
+#+end_src
+
+Create a bounded pack for another root:
+
+#+begin_src prolog
+artifact_context_pack(
+    Store,
+    [project, demo],
+    [max_items(8), max_chars(4000), consumer(next_root)],
+    Outcome).
+#+end_src
+
+A fresh root can consume selected durable state without receiving the entire preceding conversation.
+
+* 41. Structured outcomes and repair
+
+A Prolog runtime must distinguish logical failure from exceptions and resource exhaustion.
+
+The outcome subsystem classifies states such as:
+
+- success;
+- logical failure;
+- timeout;
+- depth exhaustion;
+- resource exhaustion;
+- capability denial;
+- validation failure;
+- exception.
+
+Inspect before execution:
+
+#+begin_src prolog
+plan_inspect(Plan, Capabilities, Budget, Inspection).
+#+end_src
+
+Inspect predicate metadata:
+
+#+begin_src prolog
+predicate_inspect(my_module:worker(_), Inspection).
+#+end_src
+
+Bounded repair:
+
+#+begin_src prolog
+plan_repair(
+    Plan,
+    Capabilities,
+    RuntimeOptions,
+    Inputs,
+    TrustedRepairHandler,
+    Outcome).
+#+end_src
+
+Repair must not reset resource consumption already spent by the failing attempt.
+
+* 42. MCP is an interoperability boundary, not the core inference path
+
+The =rlm_mcp= layer normalizes MCP protocol behavior into canonical Prolog terms. Version-specific details should stay in adapters rather than leak into agent/graph/plan logic.
+
+Canonical operations include concepts such as:
+
+#+begin_src prolog
+list_tools.
+list_tools(Cursor).
+call_tool(Name, Arguments).
+list_resources.
+read_resource(Uri).
+list_prompts.
+get_prompt(Name, Arguments).
+#+end_src
+
+Core model inference remains provider-native through =rlm_chain=. Do not couple the RLM architecture to MCP Sampling.
+
+* 43. Benchmark what the harness actually controls
+
+A useful RLM benchmark should record more than answer quality.
+
+Track:
+
+- final task score;
+- model calls;
+- prompt/completion/total tokens;
+- provider cost when available;
+- wall time;
+- recursion depth;
+- context bytes/items inspected;
+- tool calls;
+- plan parse/validation failures;
+- repair attempts;
+- cancellation behavior;
+- capability violations;
+- selected underlying model.
+
+Run deterministic conformance:
+
+#+begin_src sh
+swipl -q -s benchmark/run.pl -- deterministic
+#+end_src
+
+Write report:
+
+#+begin_src sh
+swipl -q -s benchmark/run.pl -- deterministic report.json
+#+end_src
+
+Do not compare a direct model and an RLM under wildly different budgets and then attribute the difference to architecture.
+
+* 44. Build a bounded repository-analysis RLM
+
+Now assemble the pieces into a concrete project.
+
+Target:
+
+#+begin_example
+configured repository root
+          |
+          v
+   project_read tool
+          |
+          v
+query + opaque task context
+          |
+          v
+      root planner
+       /    |    \
+      /     |     \
+ context   tool   depth-1 child
+   ops     read       model
+      \      |       /
+       \     |      /
+        structured result
+              |
+              v
+       selected artifact
+#+end_example
+
+The child should reason over selected evidence but should not independently gain filesystem authority.
+
+* 45. Capstone step 1: create the tool boundary
+
+#+begin_src prolog
+:- use_module('prolog/rlm').
+:- use_module('prolog/rlm_tool').
+
+open_project_registry(Root, Registry) :-
+    tool_registry_create(Registry),
+    register_project_read_tool(
+        Registry,
+        Root,
+        [ max_file_bytes(16384),
+          time_limit(1.0)
+        ],
+        ok(_)).
+#+end_src
+
+Do not pass =Root= from model text. It is host configuration.
+
+* 46. Capstone step 2: define authority
+
+Root capabilities:
+
+#+begin_src prolog
+RootCaps = [
+    rlm,
+    context(search),
+    context(slice),
+    tool(project_read),
+    model(openrouter)
+].
+#+end_src
+
+Child capabilities:
+
+#+begin_src prolog
+ChildCaps = [model(openrouter)].
+#+end_src
+
+The child can analyze selected material supplied by the root plan, but it cannot arbitrarily read more project files.
+
+* 47. Capstone step 3: define one global budget
+
+#+begin_src prolog
+Budget = _{
+    max_recursion_depth:1,
+    max_model_calls:4,
+    max_tool_calls:3,
+    max_context_ops:2,
+    max_total_tokens:10000,
+    max_cost_usd:0.25,
+    max_output_bytes:32768,
+    time_limit:120.0
+}.
+#+end_src
+
+Keep depth at 1 until you have measured a task that justifies deeper recursion.
+
+* 48. Capstone step 4: run the supervisor
+
+#+begin_src prolog
+run_repository_analysis(Root, Outcome) :-
+    open_project_registry(Root, Registry),
+    setup_call_cleanup(
+        true,
+        run_repository_analysis_with_registry(Registry, Outcome),
+        tool_registry_destroy(Registry)).
+
+run_repository_analysis_with_registry(Registry, Outcome) :-
+    RootCaps = [
+        rlm,
+        context(search),
+        context(slice),
+        tool(project_read),
+        model(openrouter)
+    ],
+    ChildCaps = [model(openrouter)],
+    Budget = _{
+        max_recursion_depth:1,
+        max_model_calls:4,
+        max_tool_calls:3,
+        max_context_ops:2,
+        max_total_tokens:10000,
+        max_cost_usd:0.25,
+        max_output_bytes:32768,
+        time_limit:120.0
+    },
+    Context = text(
+        "Find the runtime entrypoint, execution-safety boundary, and module responsible for recursive execution."),
+    rlm_completion(
+        "Analyze the repository using bounded evidence. Return claims tied to the files that support them.",
+        Context,
+        [ capabilities(RootCaps),
+          child_capabilities(ChildCaps),
+          tool_registry(Registry),
+          budget(Budget)
+        ],
+        Outcome).
+#+end_src
+
+For production, also pin an appropriate provider/model and add a task-specific planner instruction that describes the allowed evidence-gathering shape.
+
+* 49. Capstone step 5: inspect execution, not only prose
+
+After a run, verify:
+
+- which files were read;
+- which context operations ran;
+- whether each tool authorization was allowed before invocation;
+- actual model-call count;
+- actual recursion depth;
+- child capability set;
+- provider-selected model;
+- usage/cost metadata;
+- plan retries/rejections;
+- cancellation status;
+- final structured value.
+
+If the answer sounds good but the trace shows authority widening, the run is bad.
+
+If the answer sounds good but cost accounting disappears after a failure, issue #44 matters.
+
+If nested outputs exist but the trajectory omits their true depth, issue #45 matters.
+
+* 50. Capstone step 6: publish only selected durable state
+
+Do not turn every provider transcript into permanent memory.
+
+After validation, publish a compact artifact containing:
+
+- architecture summary;
+- supporting file paths;
+- unresolved questions;
+- source commit;
+- producer run identity.
+
+Then create a fresh root from an =artifact_context_pack/4= bounded by item and character count.
+
+That gives you a chained reasoning workflow without a permanently growing prompt.
+
+* 51. Capstone step 7: place a graph around repeated work
+
+A reasonable graph shape is:
+
+#+begin_example
+collect_evidence
+       |
+       v
+    analyze
+       |
+       v
+    verify
+    /    \
+ retry  publish
+           |
+           v
+          end
+#+end_example
+
+Give =retry= a finite counter.
+
+If publication has side effects, add an interrupt/approval boundary before the publish node.
+
+The graph owns workflow state. The artifact store owns selected durable knowledge. The provider transcript owns neither.
+
+* 52. When to use direct LM, RLM, agent, or graph
+
+Use the cheapest mechanism that expresses the task cleanly.
+
+#+begin_example
+direct LM
+  -> small self-contained inference
+
+deterministic context operation
+  -> search/slice/count/partition can answer it
+
+RLM depth 1
+  -> model-selected decomposition over external context
+
+delegated agent
+  -> independent lifecycle/mailbox/supervision is useful
+
+fresh-root artifact handoff
+  -> long multi-stage reasoning without transcript inheritance
+
+graph
+  -> explicit durable workflow, loops, interrupts, resume
+#+end_example
+
+Do not use an agent because it sounds more powerful. Do not use recursion because the project is called RLM.
+
+* 53. Extending the runtime safely
+
+Suppose you want a new context transform =normalize_whitespace=.
+
+Use this order:
+
+1. define deterministic semantics;
+2. add it to the closed transform vocabulary;
+3. implement it in =rlm_context=;
+4. add positive and negative tests;
+5. expose it to plan normalization if required;
+6. keep it under the existing context capability;
+7. test byte/time limits;
+8. run the full deterministic suite;
+9. document only after behavior exists.
+
+If the operation has host side effects, it probably belongs behind a trusted tool, not inside context =map=.
+
+* 54. Do not add unrestricted =eval= to make the model "more powerful"
+
+A free-form evaluator gives the model semantic strategy *and* execution authority in one opaque blob.
+
+That defeats the architecture.
+
+Prefer:
+
+#+begin_example
+model output
+   |
+   v
+closed AST
+   |
+   v
+normalization
+   |
+   v
+capability validation
+   |
+   v
+budget validation
+   |
+   v
+trusted interpreter
+#+end_example
+
+A useful harness is powerful because the host exposes strong *specific* operations, not because it turns text into ambient code execution.
+
+* 55. Testing strategy
+
+Split tests by trust boundary.
+
+**Deterministic unit/conformance**
+
+Use model doubles only where the thing being tested is the host runtime.
+
+Test:
+
+- parsing;
+- validation;
+- capability denial;
+- budget accounting;
+- context operations;
+- graph resume;
+- artifact persistence;
+- cancellation;
+- recursion guards.
+
+**Live provider integration**
+
+Use a real provider call. Never silently fall back to a fake.
+
+Pin a suitable model when response semantics matter.
+
+**Deep recursion experiment**
+
+Compare depth 0/1/2 under controlled budgets and record whether deeper recursion helps, hurts, or is neutral.
+
+* 56. Debugging decision tree
+
+**Context result is wrong**
+
+Call =rlm_context= directly. Inspect =context_trace/3=.
+
+**Planner returns text but execution does not start**
+
+Call =plan_parse/2= then =plan_validate/4=. Do not start by changing provider temperature.
+
+**Tool does not run**
+
+Inspect capability authorization and argument schema validation first.
+
+**Child uses root-only authority**
+
+Treat it as a security bug. Capability inheritance is narrowing-only.
+
+**Model calls disappear from a failed completion's usage**
+
+Check issue #44.
+
+**Nested call happened but trajectory depth is wrong/missing**
+
+Check issue #45.
+
+**Distinct recursive Prolog terms are falsely flagged as a cycle**
+
+Check issue #42 and anonymous dict tags.
+
+**Live CI gives HTTP 200 but sentinel assertions fail**
+
+Inspect the selected underlying model. If using =openrouter/free=, provider routing may have changed.
+
+* 57. Recommended reading order in prolog-rlm
+
+Read in execution order:
+
+1. =README.md=;
+2. =prolog/rlm.pl=;
+3. =prolog/rlm_context.pl=;
+4. =test/rlm_context_test.pl=;
+5. =prolog/rlm_plan.pl=;
+6. =test/rlm_plan_test.pl=;
+7. =prolog/rlm_tool.pl=;
+8. =prolog/rlm_chain.pl=;
+9. =prolog/rlm_completion.pl=;
+10. completion tests and live OpenRouter tests;
+11. =prolog/rlm_recursion_policy.pl=;
+12. =prolog/rlm_recursion_runtime.pl=;
+13. =prolog/rlm_deep_experiment.pl=;
+14. =docs/deep-recursion-experiments.md=;
+15. =prolog/rlm_agent.pl=;
+16. =prolog/rlm_graph.pl=;
+17. =prolog/rlm_artifact.pl=;
+18. =prolog/rlm_trace.pl=;
+19. =prolog/rlm_mcp.pl=;
+20. =benchmark/=;
+21. =research/= after the executable contracts are clear.
+
+Reading MCP first gives you protocol detail before you understand the control model. Reading prompts first hides the deterministic substrate.
+
+* 58. Architectural rules worth preserving
+
+When extending =prolog-rlm=, preserve these invariants:
+
+1. model output is data until validated;
+2. no unrestricted model-generated =call/1=;
+3. child authority cannot exceed parent authority;
+4. recursion shares global budgets;
+5. deeper recursion is evidence-gated, not prestige-gated;
+6. deterministic context operations should beat model calls when they solve the task;
+7. cancellation must reach descendant work;
+8. provider credentials stay out of normal traces/config terms;
+9. durable artifacts are selected state, not automatic transcript dumps;
+10. traces should eventually be authoritative execution events, not reconstructions from final lexical scope.
+
+* 59. Research references
+
+Primary RLM and harness sources used for the conceptual background:
+
+- Recursive Language Models, arXiv:2512.24601: https://arxiv.org/abs/2512.24601
+- Official RLM implementation: https://github.com/alexzhang13/rlm
+- Official minimal RLM implementation: https://github.com/alexzhang13/rlm-minimal
+- Think, But Don't Overthink, arXiv:2603.02615: https://arxiv.org/abs/2603.02615
+- SRLM, arXiv:2603.15653: https://arxiv.org/abs/2603.15653
+- lambda-RLM, arXiv:2603.20105: https://arxiv.org/abs/2603.20105
+- Recursive Agent Harnesses, arXiv:2606.13643: https://arxiv.org/abs/2606.13643
+- Chained Recursive Language Models, arXiv:2608.05124: https://arxiv.org/abs/2608.05124
+- Language model harnesses are compositional generalizers: https://alexzhang13.github.io/blog/2026/harness/
+
+Implementation sources:
+
+- =prolog-rlm=: https://github.com/lost-rob0t/prolog-rlm
+- reviewed commit: https://github.com/lost-rob0t/prolog-rlm/commit/52ca8060456a0e91b69783867d6733026b94d07e
+- deep-recursion runtime notes: https://github.com/lost-rob0t/prolog-rlm/blob/main/docs/deep-recursion-experiments.md
+- issue #42: https://github.com/lost-rob0t/prolog-rlm/issues/42
+- issue #44: https://github.com/lost-rob0t/prolog-rlm/issues/44
+- issue #45: https://github.com/lost-rob0t/prolog-rlm/issues/45
+
+* 60. Final mental model
+
+The useful mental model is not:
+
+#+begin_quote
+An RLM is an LLM that calls itself a lot.
+#+end_quote
+
+It is:
+
+#+begin_quote
+An RLM is a bounded inference harness that keeps large task state outside the immediate model context, lets a model choose structured computations over that state, and recursively delegates selected reasoning only when the expected value justifies the cost.
+#+end_quote
+
+In =prolog-rlm=, Prolog is the control substrate that makes those computations explicit: terms, capabilities, validation, budgets, cancellation, supervision, graphs, artifacts, and traces.
+
+That control boundary is the thing to preserve.
