@@ -1,0 +1,107 @@
+/* Kindle-friendly reflowable EPUB styling.
+   Keep body typography reader-controlled; style only structure and code. */
+
+body {
+  line-height: 1.45;
+  widows: 2;
+  orphans: 2;
+}
+
+h1 {
+  break-before: page;
+  page-break-before: always;
+  margin-top: 0;
+}
+
+h2,
+h3,
+h4 {
+  break-after: avoid;
+  page-break-after: avoid;
+}
+
+p,
+li {
+  hyphens: auto;
+}
+
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  hyphens: none;
+  font-family: monospace;
+  font-size: 0.78em;
+  line-height: 1.32;
+  margin: 1em 0;
+  padding: 0.65em 0.75em;
+  border-left: 0.2em solid currentColor;
+  break-inside: auto;
+  page-break-inside: auto;
+}
+
+pre code {
+  white-space: inherit;
+  font-size: 1em;
+}
+
+code {
+  font-family: monospace;
+  overflow-wrap: anywhere;
+}
+
+blockquote {
+  margin: 1em 0.8em;
+  padding-left: 0.8em;
+  border-left: 0.15em solid currentColor;
+}
+
+img,
+svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  object-fit: contain;
+  margin: 1em auto;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+figure {
+  margin: 1em 0;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+figcaption {
+  font-size: 0.9em;
+  text-align: center;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88em;
+}
+
+th,
+td {
+  padding: 0.3em;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+hr {
+  margin: 1.5em 0;
+}
+
+nav#toc ol,
+nav[epub|type~="toc"] ol {
+  padding-left: 1.2em;
+}
+
+.sourceCode,
+.kindle-code {
+  max-width: 100%;
+}
