@@ -1,0 +1,104 @@
+:PROPERTIES:
+:ID:       4ef1435d-26ff-4e5d-8299-55dca77ac9bd
+:END:
+#+title: Authoring Technical Nodes
+#+filetags: :meta:authoring:
+
+* Goal
+
+Write technical material deep enough that the reader can modify, debug, extend,
+or reimplement the mechanism being taught.
+
+Do not produce README-style summaries when the subject requires execution flow,
+state, data structures, predicates, APIs, protocols, or failure behavior.
+
+* Research before writing
+
+For repository-specific material, inspect the current source before making
+implementation claims.  Follow the important call path, tests, configuration,
+public interfaces, and dependencies that materially affect the mechanism.
+
+When a tutorial is tightly coupled to a concrete implementation, record source
+metadata such as:
+
+#+begin_src org
+#+property: repo lost-rob0t/example
+#+property: source_ref <commit-sha>
+#+end_src
+
+Prefer a commit SHA for version-sensitive explanations.
+
+* Teach mechanisms
+
+A useful explanation traces data and control through the system.
+
+Prefer a shape like:
+
+#+begin_example
+input
+  |
+  v
+normalization
+  |
+  v
+resolver
+  |
+  v
+runtime boundary
+  |
+  v
+persistent state or side effect
+#+end_example
+
+Then explain every important edge, conversion, invariant, and failure path.
+
+* Code examples
+
+Use native Org source blocks and name the real language.
+
+Distinguish clearly between:
+
+1. exact source excerpts;
+2. simplified runnable examples;
+3. pseudocode;
+4. conceptual models.
+
+Never present pseudocode as if it came from the repository.
+
+Keep exact excerpts small.  Explain inputs, outputs, control flow, state, side
+effects, invariants, and failure modes instead of dumping files.
+
+* Minimal implementations
+
+When useful, build a tiny version first and then map it to the production
+implementation.  This works particularly well for actor systems, Prolog,
+expert systems, databases, MCP, parsers, compilers, agent runtimes, and ML
+components.
+
+* Debugging
+
+Technical tutorials should teach inspection, not just happy-path use.  Include
+concrete debugger commands, REPL interactions, logs, queries, or test commands
+when applicable, and explain what expected and failing output mean.
+
+* Source maps
+
+Repository-specific tutorials should contain an actual source map with current
+paths and important symbols, for example:
+
+#+begin_src org
+| Component | File            | Important symbols |
+|-----------+-----------------+-------------------|
+| CLI       | src/main.py     | main              |
+| Resolver  | src/resolve.py  | resolve           |
+#+end_src
+
+Do not fabricate paths or symbols.
+
+* Reuse the graph
+
+Before creating a reusable concept explanation, search existing nodes.  Link to
+the canonical concept rather than duplicating the same explanation in every
+project tutorial.
+
+See [[id:ef486266-c5d2-45ad-b81d-a5d239f874cc][Knowledge Base Conventions]].

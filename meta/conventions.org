@@ -1,0 +1,85 @@
+:PROPERTIES:
+:ID:       ef486266-c5d2-45ad-b81d-a5d239f874cc
+:END:
+#+title: Knowledge Base Conventions
+#+filetags: :meta:conventions:
+
+* Persistent identity
+
+Every meaningful Org-roam node must have a persistent UUID-backed =ID=.
+
+Example:
+
+#+begin_src org
+:PROPERTIES:
+:ID:       7d2c8c11-0ff7-4fa7-93e3-2ebd31ab54f1
+:END:
+#+title: Example Node
+#+filetags: :example:
+#+end_src
+
+Use =id:= links for durable graph edges:
+
+#+begin_src org
+See [[id:7d2c8c11-0ff7-4fa7-93e3-2ebd31ab54f1][Example Node]].
+#+end_src
+
+* Node granularity
+
+Project nodes are indexes into the graph, not monolithic manuals.  Put reusable
+mechanisms in concept or architecture nodes and link project-specific behavior
+to them.
+
+Create a supporting node only when it represents a genuinely reusable concept
+or a coherent mechanism worth navigating independently.
+
+* File placement
+
+- =projects/= for canonical project indexes;
+- =concepts/= for reusable technical concepts;
+- =architecture/= for architecture-level mechanisms;
+- =workflows/= for repeatable operational/development procedures;
+- =tutorials/= for explicitly authorized tutorials;
+- =references/= for source/reference-oriented material;
+- =meta/= for repository rules.
+
+Do not place Markdown tutorials in =tutorials/=.
+
+* Metadata
+
+Use only metadata that helps trace or retrieve the material.  Typical fields
+are:
+
+#+begin_src org
+#+filetags: :project:example:protocol:
+#+property: repo lost-rob0t/example
+#+property: source_ref <commit-sha>
+#+end_src
+
+Do not invent elaborate schemas merely because metadata could exist.
+
+* Incremental growth
+
+When an authorized tutorial is added:
+
+1. inspect existing nodes;
+2. reuse existing concepts;
+3. update the relevant project index;
+4. create the tutorial;
+5. create only missing supporting nodes;
+6. add useful graph links;
+7. run =make validate=.
+
+Preserve useful existing material.  Do not regenerate the entire knowledge base.
+
+* Historical accuracy
+
+Teach the current implementation unless history is explicitly the subject.  Use
+=source_ref= metadata when implementation drift would make the tutorial
+ambiguous.
+
+* Writing style
+
+Prefer concrete terminology, source paths, call graphs, data structures,
+predicates, APIs, protocols, actual commands, debugging techniques, and
+tradeoffs.  Avoid marketing language and generic AI filler.

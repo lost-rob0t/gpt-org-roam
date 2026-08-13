@@ -1,0 +1,64 @@
+:PROPERTIES:
+:ID:       bcf8cc98-9878-4345-95fc-108ac493b54d
+:END:
+#+title: Knowledge Base Index
+#+filetags: :index:org-roam:
+
+* Projects
+
+Canonical project nodes appear here after the first explicitly authorized
+project tutorial is created.
+
+* Architectures
+
+Reusable architectural nodes and cross-project mechanisms.
+
+* Languages and runtimes
+
+Language- and runtime-level material shared by multiple projects.
+
+* Protocols
+
+Transport, wire-format, RPC, and inter-process protocol nodes.
+
+* Databases
+
+Database models, persistence mechanisms, query behavior, and integration notes.
+
+* Agent systems
+
+Actors, agents, supervision, tool execution, orchestration, and related runtime
+mechanisms.
+
+* Prolog
+
+Prolog language mechanisms, predicates, foreign interfaces, and project-specific
+links will accumulate here.
+
+* Common Lisp
+
+Common Lisp runtime, conditions, macros, object systems, concurrency, and
+project-specific links will accumulate here.
+
+* Emacs
+
+Emacs, Emacs Lisp, gptel, Org, Org-roam, and development tooling.
+
+* Tooling
+
+Build, testing, debugging, Nix, CI, and repository workflows.
+
+* Tutorials
+
+Tutorials only appear after an explicit =make tutorial= instruction.  See
+[[id:e7ef9343-c232-4981-a6ac-9ec04d310bb1][Tutorial Generation Contract]].
+
+* Workflows
+
+Operational and development workflows shared across projects.
+
+* Repository meta
+
+- [[id:4ef1435d-26ff-4e5d-8299-55dca77ac9bd][Authoring Technical Nodes]]
+- [[id:ef486266-c5d2-45ad-b81d-a5d239f874cc][Knowledge Base Conventions]]
+- [[id:e7ef9343-c232-4981-a6ac-9ec04d310bb1][Tutorial Generation Contract]]
