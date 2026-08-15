@@ -1,0 +1,101 @@
+:PROPERTIES:
+:ID:       fbc97d13-d3e2-4eb6-92b1-c818f5213109
+:END:
+#+title: Agent Memory as a Symbolic Knowledge Base
+#+filetags: :concept:agents:memory:prolog:knowledge-base:
+
+* Thesis
+
+An agent memory system does not need to represent every memory as retrieved prose. Durable, distilled knowledge can also be represented as facts and rules that are directly queryable.
+
+Example:
+
+#+begin_src prolog
+prefers(user, ripgrep, text_search).
+uses(user, emacs).
+project(my_project).
+supports(ripgrep, text_search).
+
+preferred_program(User, Intent, Program) :-
+    prefers(User, Program, Intent),
+    supports(Program, Intent),
+    available(Program).
+#+end_src
+
+This supports precise questions such as:
+
+#+begin_src prolog
+?- preferred_program(user, text_search, Program).
+#+end_src
+
+without requiring the model to reread an entire conversation history.
+
+* Do not collapse all memory into Prolog
+
+Symbolic memory is best for distilled relations, preferences, identities of artifacts, constraints, capabilities, provenance, and other facts that benefit from exact queries.
+
+Raw material still has value:
+
+- conversations preserve wording and context;
+- documents preserve evidence and source detail;
+- vector or full-text retrieval can recover semantically relevant passages;
+- event logs preserve chronological observations;
+- durable databases are better for large or failure-sensitive datasets.
+
+A practical memory system can therefore maintain layers:
+
+#+begin_example
+raw archive / event log
+        |
+        v
+retrieval indexes
+        |
+        v
+distillation / extraction
+        |
+        v
+symbolic facts + rules
+        |
+        v
+queries and derived knowledge
+#+end_example
+
+* Provenance matters
+
+A remembered fact should ideally retain where it came from and what kind of assertion it is.
+
+#+begin_src prolog
+memory(m42, prefers(user, ripgrep, text_search)).
+source(m42, conversation(turn_918)).
+asserted_by(m42, user).
+confidence(m42, explicit).
+#+end_src
+
+This enables policies that distinguish explicit user statements, model inferences, external observations, and stale or superseded facts.
+
+* Revision
+
+Memory should support supersession rather than destructive ambiguity:
+
+#+begin_src prolog
+supersedes(m57, m42).
+active_memory(M) :-
+    memory(M, _),
+    \+ supersedes(_, M).
+#+end_src
+
+The exact persistence layer can differ; the key concept is that the logical model exposes provenance and revision semantics.
+
+* Storage boundary
+
+SWI-Prolog dynamic predicates can act as a live in-process knowledge base, but they are not automatically the right durable backing store for very large, rapidly changing, or failure-sensitive memory. A durable database or document store can remain authoritative while Prolog receives the reasoning-relevant projection.
+
+* Source
+
+- SWI-Prolog dynamic predicate management: https://www.swi-prolog.org/pldoc/man?section=dynpreds
+- SWI-Prolog database package introduction: https://www.swi-prolog.org/pldoc/man?section=db-intro
+
+* Related nodes
+
+- [[id:10860388-7e61-40cf-9d90-7d1b7ca9c206][Symbolic Verification with Prolog]]
+- [[id:c6f25e86-3d79-4663-9485-7586f9beb8bd][RLMs, Symbolic Reasoning, and Verified Agent Loops]]

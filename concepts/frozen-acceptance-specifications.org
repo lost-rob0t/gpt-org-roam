@@ -1,0 +1,89 @@
+:PROPERTIES:
+:ID:       0d1f476a-505c-4798-88b5-f8a12a8df875
+:END:
+#+title: Frozen Acceptance Specifications for Autonomous Agents
+#+filetags: :concept:agents:specifications:verification:contracts:
+
+* Core distinction
+
+A plan describes how an agent currently intends to perform work. A specification describes what must be true before the result is accepted.
+
+For autonomous work, these should be separate authorities. The worker may revise its plan as it learns, but it should not be able to weaken the acceptance conditions that judge its own output.
+
+* Lifecycle
+
+#+begin_example
+request
+  -> draft acceptance specification
+  -> review / expansion
+  -> freeze specification
+  -> autonomous work
+  -> independent evidence extraction
+  -> verification
+  -> accept or reject
+#+end_example
+
+The specification constrains the acceptance boundary, not the worker's internal reasoning trajectory.
+
+* Frozen means versioned, not eternally immutable
+
+A frozen specification is immutable for one execution attempt. Legitimate requirement changes create a new specification version rather than silently editing the old one.
+
+A minimal provenance model can record:
+
+#+begin_src prolog
+spec(spec_v1).
+spec_status(spec_v1, frozen).
+spec_hash(spec_v1, "sha256:...").
+
+spec(spec_v2).
+supersedes(spec_v2, spec_v1).
+#+end_src
+
+This preserves the answer to an important audit question: /what conditions was this artifact actually judged against?/
+
+* Authorship
+
+A human, an LLM, a compiler, or a hybrid process may draft a specification. Authorship is less important than authority separation.
+
+The dangerous pattern is:
+
+#+begin_example
+worker chooses requirements
+worker implements requirements
+worker decides whether requirements were met
+#+end_example
+
+The stronger pattern is:
+
+#+begin_example
+specification authority -> frozen acceptance contract
+worker                  -> candidate artifact
+observers                -> evidence
+verifier                 -> decision
+#+end_example
+
+* Good specification contents
+
+Depending on the task, acceptance facts may describe:
+
+- required functions, predicates, schemas, files, or APIs;
+- required observable outputs;
+- required tests and process exit conditions;
+- invariants that must hold across executions;
+- forbidden behavior;
+- required provenance or source coverage;
+- adversarial checks intended to catch vacuous success;
+- evidence that must be independently observable.
+
+A specification should avoid overspecifying implementation strategy unless the strategy itself is a requirement.
+
+* Relationship to other nodes
+
+- [[id:f7d9cabc-fd5c-4170-80b7-b85945d8d914][Proof-Carrying Execution]] describes how candidate work can carry evidence against a frozen specification.
+- [[id:10860388-7e61-40cf-9d90-7d1b7ca9c206][Symbolic Verification with Prolog]] describes one verifier implementation model.
+- [[id:a3161109-44f1-4955-be1b-7fbdc203cac1][Spec-Carrying Agent Loop]] composes the concept into an agent architecture.
+
+* Status
+
+This node is an architectural synthesis/proposal. It is not a claim that freezing an informal specification produces a formal proof of program correctness.

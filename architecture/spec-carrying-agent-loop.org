@@ -1,0 +1,112 @@
+:PROPERTIES:
+:ID:       a3161109-44f1-4955-be1b-7fbdc203cac1
+:END:
+#+title: Spec-Carrying Agent Loop
+#+filetags: :architecture:agents:rlm:prolog:verification:specifications:
+
+* Architecture
+
+This architecture separates exploratory intelligence from deterministic acceptance.
+
+#+begin_example
+human / upstream agent
+        |
+        v
+acceptance-spec author
+        |
+        v
+frozen specification ----------------------+
+        |                                   |
+        v                                   |
+LLM / RLM worker                            |
+        |                                   |
+        v                                   |
+candidate artifacts                         |
+        |                                   |
+        +--> static parser -----------------+--> evidence facts
+        +--> test runner -------------------+        |
+        +--> mutation runner ---------------+        v
+        +--> runtime observer --------------+   Prolog verifier
+        +--> provenance collector ----------+        |
+                                                     +--> accept
+                                                     `--> reject + reasons
+#+end_example
+
+* Authority boundaries
+
+The architecture has four authorities:
+
+1. *Specification authority* — defines what acceptance means.
+2. *Worker authority* — may explore, code, search, call tools, and revise its plan.
+3. *Observation authority* — converts source trees, process execution, tests, mutation runs, and provenance into evidence facts.
+4. *Verification authority* — derives whether the observed facts satisfy the frozen specification.
+
+The boundaries can be implemented in one program, but the logical authorities should remain distinct. In particular, the worker should not be able to rewrite the frozen specification or fabricate observer facts and have them treated as trusted observations.
+
+* Why the worker may remain flexible
+
+A rigid plan can become wrong as soon as new information appears. The worker should therefore be free to change tactics.
+
+The invariant is not /follow exactly these steps/. It is /produce an artifact that satisfies these acceptance conditions and provide independently checkable evidence/.
+
+This gives:
+
+#+begin_example
+loose exploration + strict acceptance
+#+end_example
+
+rather than:
+
+#+begin_example
+strict scripted exploration + subjective completion claim
+#+end_example
+
+* RLM role
+
+Recursive Language Models treat long input as an external environment that the model can programmatically inspect, decompose, and recursively process. In this architecture, that mechanism belongs primarily on the exploratory side: source reading, large-corpus research, decomposition, synthesis, and candidate generation.
+
+The RLM does not become the verifier merely because it produced the candidate answer.
+
+* Prolog role
+
+Prolog represents specifications, observations, constraints, and derived acceptance conditions. Typical queries include:
+
+#+begin_src prolog
+?- verified.
+?- verification_failure(Reason).
+?- unsatisfied_requirement(Requirement).
+?- candidate(Intent, Capability).
+#+end_src
+
+* Mutation-testing role
+
+A successful test process proves very little if the tests would also pass against a deliberately broken implementation. Mutation testing supplies adversarial evidence by introducing controlled defects and checking whether the test suite detects them.
+
+A frozen specification can name critical mutants or mutation classes that must be killed for acceptance.
+
+* Memory role
+
+The same symbolic layer can expose durable distilled knowledge to the worker. Memory facts should retain provenance and revision semantics, while raw documents and large datasets remain in storage systems designed for those jobs.
+
+* Failure modes
+
+- *Self-grading*: worker authors weak requirements and judges itself.
+- *Evidence laundering*: LLM statements are labeled as observed runtime facts.
+- *Spec mutation*: acceptance conditions are weakened after implementation fails.
+- *Vacuous tests*: tests exit zero without distinguishing correct from incorrect behavior.
+- *Overclaiming proof*: ordinary tests and observations are described as formal correctness proofs.
+- *Knowledge-base drift*: symbolic memories lose source provenance or supersession state.
+
+* Related nodes
+
+- [[id:0d1f476a-505c-4798-88b5-f8a12a8df875][Frozen Acceptance Specifications for Autonomous Agents]]
+- [[id:f7d9cabc-fd5c-4170-80b7-b85945d8d914][Proof-Carrying Execution]]
+- [[id:10860388-7e61-40cf-9d90-7d1b7ca9c206][Symbolic Verification with Prolog]]
+- [[id:fbc97d13-d3e2-4eb6-92b1-c818f5213109][Agent Memory as a Symbolic Knowledge Base]]
+- [[id:c6f25e86-3d79-4663-9485-7586f9beb8bd][RLMs, Symbolic Reasoning, and Verified Agent Loops]]
+
+* Sources
+
+- Recursive Language Models: https://arxiv.org/abs/2512.24601
+- Proof-Carrying Code: https://doi.org/10.1145/263699.263712
+- Mutation testing and real faults: https://arxiv.org/abs/2103.07189

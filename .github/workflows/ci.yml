@@ -40,6 +40,7 @@ jobs:
 
           ids = {}
           contents = {}
+          file_ids = {}
 
           for path in org_files:
               try:
@@ -50,20 +51,37 @@ jobs:
               if not text.strip():
                   sys.exit(f'{path}: empty Org document')
 
-              contents[path] = text
+              if not title_re.search(text):
+                  sys.exit(f'{path}: missing #+title')
 
-              for value in id_re.findall(text):
+              values = id_re.findall(text)
+              if not values:
+                  sys.exit(f'{path}: missing Org-roam :ID:')
+
+              contents[path] = text
+              file_ids[path] = values
+
+              for value in values:
                   if value in ids:
                       sys.exit(f'duplicate Org-roam ID {value}: {ids[value]} and {path}')
                   ids[value] = path
-
-              if path.parts and path.parts[0] == 'tutorials' and not title_re.search(text):
-                  sys.exit(f'{path}: tutorial is missing #+title')
 
           for path, text in contents.items():
               for target in link_re.findall(text):
                   if target not in ids:
                       sys.exit(f'{path}: unresolved Org-roam id link {target}')
 
-          print(f'validated {len(org_files)} Org files and {len(ids)} unique Org-roam IDs')
+          index_text = contents[index]
+          index_targets = set(link_re.findall(index_text))
+
+          for path, values in file_ids.items():
+              if path.parts and path.parts[0] == 'tutorials':
+                  root_id = values[0]
+                  if root_id not in index_targets:
+                      sys.exit(f'{path}: tutorial root ID {root_id} is not linked from index.org')
+
+          print(
+              f'validated {len(org_files)} Org files, '
+              f'{len(ids)} unique Org-roam IDs, and indexed tutorials'
+          )
           PY
