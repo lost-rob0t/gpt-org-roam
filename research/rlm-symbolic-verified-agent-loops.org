@@ -1,0 +1,134 @@
+:PROPERTIES:
+:ID:       c6f25e86-3d79-4663-9485-7586f9beb8bd
+:END:
+#+title: RLMs, Symbolic Reasoning, and Verified Agent Loops
+#+filetags: :research:rlm:llm:prolog:agents:verification:mutation-testing:
+#+status: REVIEW
+
+* Research question
+
+Can an autonomous LLM system improve both exploratory quality and completion reliability by combining:
+
+1. Recursive Language Model-style decomposition for large-context exploration;
+2. symbolic facts and rules for constraints, memory, and acceptance;
+3. frozen acceptance specifications;
+4. independently extracted execution evidence; and
+5. adversarial test-quality checks such as mutation testing?
+
+This note separates established source claims from the architectural synthesis built on top of them.
+
+* Source-grounded findings
+
+** Recursive Language Models
+
+Zhang, Kraska, and Khattab describe Recursive Language Models as an inference strategy in which long prompts are treated as part of an external environment. The model programmatically examines and decomposes that environment and may recursively invoke language-model calls over selected parts.
+
+This supports using RLM-style machinery for large repositories, research corpora, logs, and other tasks where exploration cannot be reduced to one fixed context window.
+
+Source: https://arxiv.org/abs/2512.24601
+
+** Proof-Carrying Code
+
+Necula's Proof-Carrying Code establishes a producer/consumer separation: the producer supplies code with a proof that the code respects a previously defined safety policy, and the consumer validates that proof before execution.
+
+The important reusable architectural idea here is /producer evidence checked against consumer-defined policy/. Ordinary tests, runtime observations, and LLM-generated facts are not automatically formal PCC proofs.
+
+Source: https://doi.org/10.1145/263699.263712
+
+** Mutation testing
+
+Mutation testing introduces artificial defects and checks whether the test suite detects them. Research by Petrović et al. reports evidence linking mutants to real faults and studies how mutation testing can expose holes in test suites.
+
+For agent verification, this gives a concrete mechanism for testing whether a nominally passing suite can distinguish a correct implementation from selected known-wrong variants.
+
+Source: https://arxiv.org/abs/2103.07189
+
+** Prolog as mutable symbolic state
+
+SWI-Prolog dynamic predicates can be changed at runtime using operations such as =assertz/1= and =retract/1=. This supports a live fact/rule store for reasoning.
+
+SWI-Prolog also documents a boundary: its native Prolog database is not intended to replace external durable databases for very large or rapidly changing failure-sensitive datasets.
+
+Sources:
+- https://www.swi-prolog.org/pldoc/man?section=dynpreds
+- https://www.swi-prolog.org/pldoc/man?section=db-intro
+
+* Synthesis
+
+The combined architecture suggested by these sources is:
+
+#+begin_example
+large corpus / task
+        |
+        v
+RLM exploration and decomposition
+        |
+        v
+candidate claims / code / artifacts
+        |
+        +-------------------------------+
+        |                               |
+        v                               v
+symbolic memory                  independent observers
+        |                               |
+        v                               v
+facts + rules                    evidence facts
+        |                               |
+        +---------------+---------------+
+                        |
+                        v
+                Prolog verification
+                        |
+                        v
+             acceptance / failures
+#+end_example
+
+This is a proposal, not a result established by any single cited paper.
+
+* Why a specification is stronger than a fixed plan
+
+A plan is a strategy. An exploratory model should be able to revise strategy when evidence changes.
+
+A specification is an acceptance boundary. Freezing it before the worker produces the final artifact prevents a basic failure mode in which an agent weakens its own success criteria after encountering difficulty.
+
+The design therefore aims for flexible search with inflexible acceptance.
+
+* Research hypotheses
+
+- RLM-style exploration should improve coverage of large research/code contexts compared with one-shot prompting, but the improvement must be measured for the actual workload.
+- A symbolic verifier should reduce ambiguity in completion decisions when requirements can be expressed as observable predicates.
+- Mutation checks should catch some classes of vacuous or insufficient tests that exit-code-only verification misses.
+- Provenance-bearing symbolic memory may reduce repeated context reconstruction for durable facts and constraints.
+- Separating specification, worker, observer, and verifier authority should make failures easier to audit than a single agent self-reporting completion.
+
+These are hypotheses until experimentally tested.
+
+* Open questions
+
+- How much of a natural-language specification can be compiled into predicates without losing intent?
+- Which evidence extractors belong in the trusted computing base?
+- How should ambiguous or probabilistic research requirements be represented?
+- When should a failed run trigger a new worker plan versus a new specification version?
+- How should equivalent mutants and flaky tests be represented without creating false failures?
+- What provenance model best distinguishes user facts, model inference, retrieved evidence, and derived rules?
+- Which memories should be materialized into Prolog versus left in document/vector/durable storage?
+- Can verifier rules themselves be mutation-tested or property-tested?
+
+* Suggested experimental sequence
+
+1. Build a tiny code task with a hand-authored frozen Prolog specification.
+2. Extract required API facts from an AST or parser rather than from LLM prose.
+3. Record test process exit and named test outcomes.
+4. Add one deliberately wrong implementation and require the suite to reject it.
+5. Normalize runtime output into evidence facts.
+6. Query both =verified/0= and structured failure predicates.
+7. Repeat with the worker allowed to change its plan but not the specification.
+8. Compare false acceptance, false rejection, cost, and debugging clarity against a conventional agent loop.
+
+* Related nodes
+
+- [[id:0d1f476a-505c-4798-88b5-f8a12a8df875][Frozen Acceptance Specifications for Autonomous Agents]]
+- [[id:f7d9cabc-fd5c-4170-80b7-b85945d8d914][Proof-Carrying Execution]]
+- [[id:10860388-7e61-40cf-9d90-7d1b7ca9c206][Symbolic Verification with Prolog]]
+- [[id:fbc97d13-d3e2-4eb6-92b1-c818f5213109][Agent Memory as a Symbolic Knowledge Base]]
+- [[id:a3161109-44f1-4955-be1b-7fbdc203cac1][Spec-Carrying Agent Loop]]
