@@ -1,0 +1,119 @@
+:PROPERTIES:
+:ID:       f7d9cabc-fd5c-4170-80b7-b85945d8d914
+:END:
+#+title: Proof-Carrying Execution
+#+filetags: :concept:agents:proofs:verification:evidence:
+
+* Idea
+
+Proof-Carrying Execution is a proposed agent architecture in which a worker does not merely return an artifact and claim completion. It returns an artifact plus machine-checkable evidence that the artifact satisfies a previously frozen acceptance specification.
+
+The term is deliberately inspired by Proof-Carrying Code, but the two must not be conflated. Necula's Proof-Carrying Code attaches a formal proof that code satisfies a defined safety policy. The agent pattern described here may use much weaker evidence: parsed APIs, test results, mutation outcomes, runtime observations, provenance, or logical derivations. Unless the evidence and verifier are formally sound, this is not a formal correctness proof.
+
+* Minimal flow
+
+#+begin_example
+frozen specification
+        |
+        v
+     worker
+        |
+        v
+candidate artifact
+        |
+        v
+independent evidence extractors
+        |
+        v
+machine-readable facts
+        |
+        v
+     verifier
+        |
+        +--> accepted
+        `--> rejected + reasons
+#+end_example
+
+* Evidence classes
+
+** Static evidence
+
+Facts obtained from source or artifact structure without trusting worker prose:
+
+#+begin_src prolog
+function_exists(search).
+exported(search).
+function_arity(search, 2).
+#+end_src
+
+** Test-process evidence
+
+#+begin_src prolog
+process_exit(test_suite, 0).
+test_passed(search_returns_results).
+#+end_src
+
+An exit code alone is weak evidence. A vacuous or misdirected test can still exit successfully.
+
+** Adversarial test evidence
+
+Mutation testing can ask whether a test suite notices intentionally wrong implementations. A surviving mutant is evidence that the test suite may not establish the intended behavior.
+
+#+begin_src prolog
+must_kill(search_always_empty).
+mutant_survived(search_always_empty).
+#+end_src
+
+** Runtime evidence
+
+#+begin_src prolog
+program_exit(search_example, 0).
+output_contains(search_example, "starintel").
+#+end_src
+
+Runtime evidence should be normalized from actual process observations, not generated from a worker's natural-language summary.
+
+** Provenance evidence
+
+For research and data tasks, evidence may include source identity, retrieval time, hashes, claim/source mappings, or explicit counterevidence checks.
+
+* Acceptance is a query
+
+A verifier should make both success and failure queryable:
+
+#+begin_src prolog
+verified :-
+    spec_hash_valid,
+    required_api_satisfied,
+    tests_satisfied,
+    mutation_requirements_satisfied,
+    runtime_satisfied.
+
+verification_failure(required_function_missing(F)) :-
+    requires_function(F),
+    \+ function_exists(F).
+#+end_src
+
+This produces an explainable rejection boundary rather than a binary self-report from the worker.
+
+* Trust boundary
+
+The useful separation is:
+
+- specification authority defines acceptance;
+- worker produces candidate work;
+- evidence extractors observe the candidate and executions;
+- verifier decides whether facts satisfy the specification.
+
+If all four are freely controlled by the same agent invocation, the architecture collapses back toward self-grading.
+
+* Sources and lineage
+
+- George C. Necula, "Proof-Carrying Code", POPL 1997: https://doi.org/10.1145/263699.263712
+- Mutation testing evidence and surviving mutants: https://arxiv.org/abs/2103.07189
+
+* Related nodes
+
+- [[id:0d1f476a-505c-4798-88b5-f8a12a8df875][Frozen Acceptance Specifications for Autonomous Agents]]
+- [[id:10860388-7e61-40cf-9d90-7d1b7ca9c206][Symbolic Verification with Prolog]]
+- [[id:a3161109-44f1-4955-be1b-7fbdc203cac1][Spec-Carrying Agent Loop]]
