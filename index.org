@@ -1,18 +1,36 @@
 :PROPERTIES:
 :ID:       39d04aa8-7b66-4fa1-b25c-1fb724461793
 :END:
-#+title: GPT Org-roam Learning Graph
-#+filetags: :index:learning:
+#+title: GPT Org-roam Knowledge Graph
+#+filetags: :index:knowledge:learning:
+
+* Core concepts
+
+** Autonomous specifications and verification
+- [[id:0d1f476a-505c-4798-88b5-f8a12a8df875][Frozen Acceptance Specifications for Autonomous Agents]]
+- [[id:f7d9cabc-fd5c-4170-80b7-b85945d8d914][Proof-Carrying Execution]]
+- [[id:10860388-7e61-40cf-9d90-7d1b7ca9c206][Symbolic Verification with Prolog]]
+
+** Memory and symbolic knowledge
+- [[id:fbc97d13-d3e2-4eb6-92b1-c818f5213109][Agent Memory as a Symbolic Knowledge Base]]
+
+** Project-specific concepts retained in the learning graph
+- [[id:c91d5283-f96e-4d95-92f6-a926ea6951f5][StarLang Spec Libraries and Portable Contracts]]
+
+* Research
+- [[id:c6f25e86-3d79-4663-9485-7586f9beb8bd][RLMs, Symbolic Reasoning, and Verified Agent Loops]]
+
+* Architecture
+- [[id:a3161109-44f1-4955-be1b-7fbdc203cac1][Spec-Carrying Agent Loop]]
+- [[id:dca7bf46-7062-4e34-bfaf-8bec6e520a42][StarLang Compiler and Runtime Architecture]]
+
+* Tutorials
+- [[id:efbd8078-67b9-4f9e-adcf-99d94338d289][Prolog-RLM Deep Dive: Building Bounded Recursive LLM Harnesses in SWI-Prolog]]
+- [[id:41d65192-9402-4597-940d-3fb304e6ebc9][StarLang from Zero to Advanced: Contracts, Actors, Service URIs, and Durable Runtime]]
 
 * Projects
 - [[id:1111004a-95fd-488b-979b-e8433431e299][StarLang]]
 
-* Tutorials
-- [[id:41d65192-9402-4597-940d-3fb304e6ebc9][StarLang from Zero to Advanced: Contracts, Actors, Service URIs, and Durable Runtime]]
-- [[id:efbd8078-67b9-4f9e-adcf-99d94338d289][Prolog-RLM Deep Dive: Building Bounded Recursive LLM Harnesses in SWI-Prolog]]
+* Repository model
 
-* Architecture
-- [[id:dca7bf46-7062-4e34-bfaf-8bec6e520a42][StarLang Compiler and Runtime Architecture]]
-
-* Concepts
-- [[id:c91d5283-f96e-4d95-92f6-a926ea6951f5][StarLang Spec Libraries and Portable Contracts]]
+Reusable theory belongs in concepts and research. Architectures compose it. Tutorials remain first-class guided learning paths. Projects are concrete instances. StarIntel-specific research authority lives outside this repository.
