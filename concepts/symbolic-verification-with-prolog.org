@@ -1,0 +1,101 @@
+:PROPERTIES:
+:ID:       10860388-7e61-40cf-9d90-7d1b7ca9c206
+:END:
+#+title: Symbolic Verification with Prolog
+#+filetags: :concept:prolog:verification:expert-systems:agents:
+
+* Role
+
+Prolog is a strong fit for the deterministic side of an LLM system when the job is to answer questions such as:
+
+- which requirements remain unsatisfied?
+- which candidate capabilities satisfy these constraints?
+- what evidence supports this acceptance decision?
+- what contradictions are present?
+- what alternative solutions unify with the same goal?
+
+The LLM can translate fuzzy language or unstructured observations into candidate structured facts. The verifier should then operate on facts obtained from trusted parsers, test runners, runtime observers, or reviewed assertions rather than treating arbitrary LLM output as true.
+
+* Specification facts
+
+#+begin_src prolog
+requires_function(search).
+requires_test(search_returns_results).
+requires_exit(test_suite, 0).
+must_kill(search_always_empty).
+#+end_src
+
+* Evidence facts
+
+#+begin_src prolog
+function_exists(search).
+test_passed(search_returns_results).
+process_exit(test_suite, 0).
+mutant_killed(search_always_empty).
+#+end_src
+
+* Rules
+
+#+begin_src prolog
+required_functions_satisfied :-
+    forall(requires_function(F), function_exists(F)).
+
+required_tests_satisfied :-
+    forall(requires_test(T), test_passed(T)).
+
+required_mutants_killed :-
+    forall(must_kill(M), mutant_killed(M)).
+
+verified :-
+    required_functions_satisfied,
+    required_tests_satisfied,
+    required_mutants_killed,
+    forall(requires_exit(P, Code), process_exit(P, Code)).
+#+end_src
+
+* Explain failures
+
+Acceptance should not be the only useful query.
+
+#+begin_src prolog
+verification_failure(missing_function(F)) :-
+    requires_function(F),
+    \+ function_exists(F).
+
+verification_failure(test_not_observed(T)) :-
+    requires_test(T),
+    \+ test_passed(T).
+
+verification_failure(surviving_required_mutant(M)) :-
+    must_kill(M),
+    \+ mutant_killed(M).
+#+end_src
+
+This turns verification into an inspectable symbolic relation rather than a hidden boolean inside an agent prompt.
+
+* Prolog as a knowledge store
+
+SWI-Prolog supports dynamic predicates whose clauses can be added and removed with =asserta/1=, =assertz/1=, =retract/1=, and related operations. This makes a Prolog process useful as a live symbolic knowledge base as well as a rule engine.
+
+However, the native dynamic predicate database should not be confused with a general durable database. SWI-Prolog's own documentation warns that its native Prolog database is not well suited to very large or rapidly changing durable datasets that must survive failures or be shared between Prolog instances. Use external durable storage when those properties matter, and project the reasoning-relevant subset into Prolog.
+
+* Trust model
+
+A useful verifier separates three classes of facts:
+
+1. specification facts — what must be true;
+2. observed evidence facts — what independent tooling actually saw;
+3. derived facts — conclusions produced by rules.
+
+LLM-generated assertions can exist, but they should carry provenance and should not silently masquerade as observed evidence.
+
+* Sources
+
+- SWI-Prolog, managing dynamic predicates: https://www.swi-prolog.org/pldoc/man?section=dynpreds
+- SWI-Prolog, database package introduction and native-database limits: https://www.swi-prolog.org/pldoc/man?section=db-intro
+
+* Related nodes
+
+- [[id:f7d9cabc-fd5c-4170-80b7-b85945d8d914][Proof-Carrying Execution]]
+- [[id:fbc97d13-d3e2-4eb6-92b1-c818f5213109][Agent Memory as a Symbolic Knowledge Base]]
+- [[id:a3161109-44f1-4955-be1b-7fbdc203cac1][Spec-Carrying Agent Loop]]
