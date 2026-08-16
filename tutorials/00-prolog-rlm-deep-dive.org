@@ -8,6 +8,7 @@
 #+property: repo https://github.com/lost-rob0t/prolog-rlm
 #+property: source_ref main
 #+property: source_commit 52ca8060456a0e91b69783867d6733026b94d07e
+#+property: knowledge_update 2026-08-15
 
 * Goal
 
@@ -30,6 +31,7 @@ By the end you should be able to:
 - build supervised logical agents and resumable graphs;
 - use durable artifacts as bounded cross-root memory;
 - understand the current code-review sharp edges rather than treating the repo as finished;
+- place an RLM worker inside a spec-carrying verification loop without confusing model claims with independently observed evidence;
 - build a bounded repository-analysis RLM as a capstone.
 
 * 1. RLM does not mean "keep recursively prompting forever"
@@ -1773,3 +1775,257 @@ An RLM is a bounded inference harness that keeps large task state outside the im
 In =prolog-rlm=, Prolog is the control substrate that makes those computations explicit: terms, capabilities, validation, budgets, cancellation, supervision, graphs, artifacts, and traces.
 
 That control boundary is the thing to preserve.
+
+* 61. 2026-08-15 update: put the RLM inside a spec-carrying verification loop
+
+The RLM runtime answers a different question from a verifier.
+
+=prolog-rlm= asks:
+
+#+begin_quote
+How can a model explore a large task, choose bounded computations, call tools or child models, and remain under explicit authority and resource controls?
+#+end_quote
+
+A verification loop asks:
+
+#+begin_quote
+How do we decide that the artifact produced by that worker actually satisfies a frozen acceptance contract using evidence the worker cannot simply invent?
+#+end_quote
+
+Do not collapse those into one authority.
+
+The current =prolog-rlm= commit reviewed by this tutorial does *not* implement the full spec-carrying architecture below. The architecture is a separate research/design layer documented in this Org-roam graph.
+
+The useful composition is:
+
+#+begin_example
+human / upstream agent
+        |
+        v
+frozen acceptance specification --------------------+
+        |                                            |
+        v                                            |
+RLM worker                                           |
+  |                                                  |
+  +--> inspect large source/context                  |
+  +--> revise its plan                               |
+  +--> call bounded tools/models                     |
+  +--> produce candidate artifact                    |
+        |                                            |
+        +--> static parser --------------------------+--> evidence facts
+        +--> test runner ----------------------------+        |
+        +--> mutation runner ------------------------+        v
+        +--> runtime observer -----------------------+   Prolog verifier
+        +--> provenance collector ------------------+        |
+                                                          +--> accept
+                                                          `--> reject + reasons
+#+end_example
+
+The worker is intentionally flexible. The acceptance boundary is intentionally not.
+
+** 61.1 Plan versus specification
+
+A plan is an editable strategy for getting work done. An RLM should be allowed to revise it as evidence changes.
+
+A specification defines what counts as success. Once frozen for a run, the worker must not silently weaken it because implementation became difficult.
+
+That gives the system:
+
+#+begin_example
+loose exploration + strict acceptance
+#+end_example
+
+rather than:
+
+#+begin_example
+strict scripted exploration + subjective self-grading
+#+end_example
+
+See [[id:0d1f476a-505c-4798-88b5-f8a12a8df875][Frozen Acceptance Specifications for Autonomous Agents]].
+
+** 61.2 The RLM is the worker, not the verifier
+
+RLM-style decomposition is valuable on the exploratory side:
+
+- search a large repository;
+- partition long logs or corpora;
+- select evidence;
+- delegate bounded subproblems;
+- synthesize candidate code or documents;
+- revise strategy when a branch fails.
+
+But the same model that produced the candidate should not be treated as authoritative evidence that its own candidate is correct.
+
+The verifier should consume observations produced by trusted or independently constrained observers whenever practical.
+
+See [[id:a3161109-44f1-4955-be1b-7fbdc203cac1][Spec-Carrying Agent Loop]].
+
+** 61.3 Evidence facts are not the same thing as LLM claims
+
+Suppose a coding worker says:
+
+#+begin_example
+"search/2 exists and the tests pass"
+#+end_example
+
+That statement is not equivalent to an AST parser observing =search/2= or a test runner observing a named test exit successfully.
+
+Keep provenance explicit:
+
+#+begin_src prolog
+% Illustrative verification vocabulary, not current prolog-rlm API.
+observed_predicate(search, 2, source_ast).
+observed_test(search_basic, passed, test_runner).
+observed_process(test_suite, exit_code(0), process_runner).
+observed_mutation(search_always_empty, killed, mutation_runner).
+#+end_src
+
+Compare that with an untrusted worker claim:
+
+#+begin_src prolog
+worker_claim(predicate_exists(search, 2)).
+#+end_src
+
+Both can be stored as terms. They should not carry the same authority.
+
+See [[id:10860388-7e61-40cf-9d90-7d1b7ca9c206][Symbolic Verification with Prolog]].
+
+** 61.4 Write acceptance rules that are difficult to cheese
+
+A weak requirement such as:
+
+#+begin_src prolog
+required_output_contains("starintel").
+#+end_src
+
+can be satisfied by returning the literal word regardless of whether the requested behavior works.
+
+A stronger acceptance boundary checks multiple independent properties. For example:
+
+#+begin_src prolog
+% Illustrative specification vocabulary.
+required_predicate(search, 2).
+required_test(search_basic).
+required_mutation_kill(search_always_empty).
+required_runtime_exit(test_suite, 0).
+
+verified :-
+    observed_predicate(search, 2, source_ast),
+    observed_test(search_basic, passed, test_runner),
+    observed_mutation(search_always_empty, killed, mutation_runner),
+    observed_process(test_suite, exit_code(0), process_runner).
+#+end_src
+
+This still is not a formal proof of arbitrary program correctness. It is a deterministic acceptance decision over explicitly collected evidence.
+
+See [[id:f7d9cabc-fd5c-4170-80b7-b85945d8d914][Proof-Carrying Execution]].
+
+** 61.5 Mutation testing attacks vacuous tests
+
+An exit code of zero proves only that the executed suite returned zero.
+
+A broken implementation may still pass if the tests are weak, over-mocked, or accidentally assert only superficial output.
+
+Mutation testing adds deliberately wrong variants and asks whether the suite distinguishes them from the intended implementation.
+
+Conceptually:
+
+#+begin_example
+correct candidate ------------> tests pass
+always-empty search mutant ---> tests MUST fail
+always-success mutant --------> tests MUST fail
+hard-coded sentinel mutant ---> tests MUST fail
+#+end_example
+
+If a required mutant survives, the acceptance evidence should say so rather than allowing the worker to declare victory.
+
+This is especially relevant to LLM-written tests because an LLM can accidentally create a test and implementation that agree on the same wrong assumption.
+
+** 61.6 Keep four logical authorities separate
+
+A robust agent loop has at least four logical roles:
+
+1. *Specification authority* -- defines acceptance conditions.
+2. *Worker authority* -- explores, searches, codes, and revises strategy.
+3. *Observation authority* -- converts source trees, processes, tests, mutations, and provenance into evidence.
+4. *Verification authority* -- derives acceptance or structured failures from the frozen specification plus observations.
+
+They may run in one process, but they should not be conflated semantically.
+
+The critical anti-cheese rules are:
+
+- the worker cannot mutate the frozen specification in place;
+- the worker cannot label its own prose as trusted observer evidence;
+- a passing test process is not sufficient when the spec requires behavioral or mutation evidence;
+- verification rules return structured reasons for rejection;
+- changing requirements creates a new specification version with explicit provenance.
+
+** 61.7 How this composes with prolog-rlm
+
+The two systems fit cleanly without modifying the core RLM definition:
+
+#+begin_example
+spec authority
+      |
+      v
+frozen spec
+      |
+      +---------------------------+
+      |                           |
+      v                           |
+prolog-rlm worker                 |
+      |                           |
+      v                           |
+candidate artifact               |
+      |                           |
+      v                           |
+independent evidence extraction -+
+      |
+      v
+Prolog acceptance rules
+      |
+      +--> verified
+      `--> verification_failure(Reason)
+#+end_example
+
+=prolog-rlm= remains responsible for bounded inference and execution authority. The outer verification layer is responsible for deciding whether the result satisfies the acceptance contract.
+
+That separation is stronger than asking the RLM to both do the work and grade itself.
+
+** 61.8 Symbolic memory is another distinct axis
+
+A Prolog knowledge base can also hold durable distilled facts and constraints, but do not turn the Prolog database into a dump of every raw document or transcript.
+
+Keep:
+
+- raw large documents in storage designed for them;
+- RLM context handles for bounded inspection;
+- artifacts for selected cross-root state;
+- symbolic memory for compact facts/rules with provenance and supersession semantics.
+
+See [[id:fbc97d13-d3e2-4eb6-92b1-c818f5213109][Agent Memory as a Symbolic Knowledge Base]].
+
+** 61.9 Suggested next experiment
+
+A minimal verified-RLM coding experiment should be small enough that every trust boundary is visible:
+
+1. freeze a hand-authored Prolog acceptance specification;
+2. let the RLM worker inspect and modify a tiny repository task;
+3. parse the candidate source independently for required API facts;
+4. run named tests and record exit/test facts;
+5. run at least one deliberately wrong mutation and require it to be killed;
+6. normalize runtime output into evidence facts;
+7. query =verified/0= and structured failure predicates;
+8. let the worker revise its *plan* after rejection, but never the frozen spec;
+9. compare false acceptance, false rejection, cost, and debugging clarity against a conventional self-grading agent loop.
+
+The research synthesis and its open questions are tracked in [[id:c6f25e86-3d79-4663-9485-7586f9beb8bd][RLMs, Symbolic Reasoning, and Verified Agent Loops]].
+
+The core idea is now two nested control boundaries:
+
+#+begin_example
+inside:  Prolog constrains what the RLM may execute
+outside: Prolog constrains what evidence is sufficient to accept its result
+#+end_example
+
+That is a much stronger architecture than recursion alone.
