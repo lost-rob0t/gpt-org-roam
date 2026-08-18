@@ -19,6 +19,7 @@
 
 * Research
 - [[id:c6f25e86-3d79-4663-9485-7586f9beb8bd][RLMs, Symbolic Reasoning, and Verified Agent Loops]]
+- [[id:5f20b2a2-4bdd-42e2-b0c1-4996a8a039e5][Capturing LLM I/O as a Future Distillation Corpus]]
 
 * Architecture
 - [[id:a3161109-44f1-4955-be1b-7fbdc203cac1][Spec-Carrying Agent Loop]]
