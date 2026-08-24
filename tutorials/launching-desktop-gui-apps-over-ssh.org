@@ -1,0 +1,203 @@
+:PROPERTIES:
+:ID:       11b73c96-7073-46ba-88e8-f175aed498ff
+:END:
+#+title: Launching Desktop GUI Applications over SSH on X11
+#+filetags: :ssh:x11:linux:qtile:lightdm:troubleshooting:
+
+* Purpose
+
+This note records a practical recovery pattern for starting an application on an already-running Linux desktop while connected from another machine over SSH.
+
+The concrete incident that motivated the note was a NixOS desktop running Qtile under LightDM.  An Android/Termux client could SSH into the host, but starting the ChatGPT desktop application from that SSH shell failed even though the local graphical session was alive.
+
+The important distinction is that this is *not X11 forwarding*.  The application should render on the remote machine's existing physical desktop, not on the SSH client.
+
+* Failure pattern
+
+A plain SSH shell does not necessarily inherit the environment or authorization state of the graphical login session.  Setting only =DISPLAY=:0= was insufficient in the observed case.
+
+The application failed with messages equivalent to:
+
+#+begin_example
+Authorization required, but no authorization protocol specified
+Missing X server or $DISPLAY
+The platform failed to initialize. Exiting.
+#+end_example
+
+The executable itself was valid.  The failure was X11 authorization.
+
+* Mental model
+
+For an application launched from SSH to join an existing X11 desktop, four pieces commonly matter:
+
+- =DISPLAY= selects the X server, for example =:0=.
+- =XAUTHORITY= points to the X11 cookie database accepted by that server.
+- =XDG_RUNTIME_DIR= identifies the user's runtime directory, commonly =/run/user/$(id -u)=.
+- =DBUS_SESSION_BUS_ADDRESS= lets desktop applications reach the user's session bus when they need it.
+
+The first value tells the program *where* the display is.  The Xauthority cookie determines whether the program is *allowed* to use it.  This is why forcing =DISPLAY=:0= can still produce an authorization error.
+
+* Diagnose the live desktop
+
+First identify the active X server and its authority file:
+
+#+begin_src sh
+ps -eo pid,user,args | grep -E '[X]org|[X]wayland'
+#+end_src
+
+In the observed LightDM session, Xorg was started in this form:
+
+#+begin_example
+/usr/lib/Xorg :0 -seat seat0 -auth /run/lightdm/root/:0 ...
+#+end_example
+
+That =-auth= path is decisive: it identifies the cookie database the live X server was actually using.
+
+Also inspect the user's current authority database:
+
+#+begin_src sh
+ls -l "$HOME/.Xauthority"
+xauth -f "$HOME/.Xauthority" list
+#+end_src
+
+If the user's database is stale or lacks the cookie accepted by the live display, a process launched from SSH will be rejected even when =DISPLAY= is correct.
+
+* Refresh the user's X11 cookie
+
+For the LightDM layout above, copy the live display cookie into the user's own authority database:
+
+#+begin_src sh
+sudo xauth -f /run/lightdm/root/:0 nlist :0 |
+  xauth -f "$HOME/.Xauthority" nmerge -
+#+end_src
+
+This requires privilege only to read LightDM's root-owned authority file.  The resulting cookie is stored in the user's normal =~/.Xauthority= file.
+
+Do not replace this with a broad =xhost += rule.  Disabling access control is a much larger authorization change than importing the specific cookie already protecting the session.
+
+The live cookie can change after a new graphical login, so repeat the refresh when a previously-working remote launcher suddenly begins returning authorization errors after logout, reboot, or display-manager restart.
+
+* Recover the graphical session environment
+
+Once the cookie is valid, use the existing desktop values rather than inventing unrelated ones:
+
+#+begin_src sh
+export DISPLAY=:0
+export XAUTHORITY="$HOME/.Xauthority"
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+#+end_src
+
+When the user systemd manager has good values, it is also useful for inspection:
+
+#+begin_src sh
+systemctl --user show-environment |
+  grep -E '^(DISPLAY|XAUTHORITY|WAYLAND_DISPLAY|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS)='
+#+end_src
+
+Treat those values as evidence, not proof that the authority file itself is current.  In the incident recorded here, =XAUTHORITY= pointed at =~/.Xauthority= but the cookie still had to be refreshed from LightDM's live authority file.
+
+* Discover the real application executable
+
+Do not guess a desktop application's executable name.  Inspect its desktop entry:
+
+#+begin_src sh
+grep -RHi '^Exec=.*chatgpt' \
+  "$HOME/.local/share/applications" \
+  "$HOME/.nix-profile/share/applications" \
+  "/etc/profiles/per-user/$USER/share/applications" \
+  /run/current-system/sw/share/applications \
+  2>/dev/null
+#+end_src
+
+For a Nix package, the =Exec== line may point directly into =/nix/store=.  Resolve the current path from the desktop entry instead of hard-coding that store path:
+
+#+begin_src sh
+exe=$(sed -n 's/^Exec=\([^ ]*\).*/\1/p' \
+  "$HOME/.nix-profile/share/applications/chatgpt.desktop")
+#+end_src
+
+Desktop-entry placeholders such as =%U= are field codes for the launcher and are not part of the executable path.
+
+* Keep the GUI process alive with tmux
+
+An SSH transport can disappear because a phone changes networks, sleeps, or loses NAT state.  The graphical process should not be coupled to that transport.
+
+Launch it inside a detached tmux session on the desktop host:
+
+#+begin_src sh
+session=chatgpt
+
+tmux kill-session -t "$session" 2>/dev/null || true
+
+tmux new-session -d -s "$session" \
+  "export DISPLAY=:0; \
+   export XAUTHORITY='$HOME/.Xauthority'; \
+   export XDG_RUNTIME_DIR='/run/user/$(id -u)'; \
+   export DBUS_SESSION_BUS_ADDRESS='unix:path=/run/user/$(id -u)/bus'; \
+   exec '$exe'"
+#+end_src
+
+Inspect the session remotely with:
+
+#+begin_src sh
+tmux attach -t chatgpt
+#+end_src
+
+Detach with =Ctrl-b d=.  The GUI process remains attached to the desktop session even if the SSH client disconnects.
+
+* End-to-end recovery recipe
+
+On the remote desktop host, after confirming the actual Xorg =-auth= path:
+
+#+begin_src sh
+sudo xauth -f /run/lightdm/root/:0 nlist :0 |
+  xauth -f "$HOME/.Xauthority" nmerge -
+
+exe=$(sed -n 's/^Exec=\([^ ]*\).*/\1/p' \
+  "$HOME/.nix-profile/share/applications/chatgpt.desktop")
+
+export DISPLAY=:0
+export XAUTHORITY="$HOME/.Xauthority"
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+
+tmux kill-session -t chatgpt 2>/dev/null || true
+printf -v launch '%q ' env \
+  DISPLAY="$DISPLAY" \
+  XAUTHORITY="$XAUTHORITY" \
+  XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+  DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
+  "$exe"
+tmux new-session -d -s chatgpt "$launch"
+#+end_src
+
+The =printf %q= step keeps the tmux command shell-safe instead of manually constructing a fragile quoted command.
+
+* SSH keepalive for phone clients
+
+For a mobile SSH client, application persistence and SSH keepalive solve different problems.  tmux keeps the remote process alive; keepalives help keep the SSH transport itself from going idle.
+
+A host-specific =~/.ssh/config= entry can use:
+
+#+begin_src conf
+Host flake
+    ServerAliveInterval 5
+    ServerAliveCountMax 6
+    TCPKeepAlive yes
+#+end_src
+
+This sends an SSH protocol keepalive every five seconds and tolerates six unanswered probes before the client gives up.
+
+* Troubleshooting checklist
+
+- =No such file or directory=: inspect the desktop file and resolve the actual =Exec== path.
+- =Missing X server or $DISPLAY=: verify the display number and that the local X server is running.
+- =Authorization required=: compare the live Xorg =-auth= path with the user's =XAUTHORITY= cookie database.
+- process dies when SSH disconnects: launch it in tmux, a user service, or another session-independent supervisor.
+- app starts but desktop integration is broken: verify =XDG_RUNTIME_DIR= and =DBUS_SESSION_BUS_ADDRESS=.
+- recovery worked until reboot/login: refresh the live display cookie again.
+
+* Scope
+
+This recipe describes joining an existing local X11 session.  Wayland-native sessions, XWayland, different display managers, containers, and multi-seat systems can place authorization state elsewhere.  Always inspect the running display server rather than assuming the LightDM path above is universal.
