@@ -1,0 +1,377 @@
+:PROPERTIES:
+:ID:       5f20b2a2-4bdd-42e2-b0c1-4996a8a039e5
+:END:
+#+title: Capturing LLM I/O as a Future Distillation Corpus
+#+filetags: :research:llm:distillation:telemetry:provenance:prolog:
+
+* Research question
+
+What should a local LLM interception layer preserve today so that ordinary model use can later become a defensible corpus for supervised fine-tuning, sequence-level distillation, preference optimization, tool-use training, and evaluation?
+
+This note focuses on general technical design. It is not a claim that every provider permits its outputs to be used for training. Distillation eligibility is a provenance property of each captured generation and must be checked against the applicable model/provider terms.
+
+* Executive synthesis
+
+The useful asset is not a monthly token counter. It is the exact model boundary traffic plus enough provenance to reconstruct why the generation happened, what the model actually saw, what it returned, which tools participated, how the user reacted, and whether the output may legally and contractually be reused for training.
+
+A robust capture system should therefore keep three distinct layers:
+
+1. an append-only encrypted raw ledger containing the exact request/response/event stream;
+2. a normalized provider-independent generation record suitable for analytics and replay;
+3. derived, redacted, policy-filtered dataset exports for SFT, preference learning, tool-use training, and evals.
+
+The raw ledger and the training corpus must not be the same object. The former is evidence and replay material. The latter is a compiled product with explicit eligibility, redaction, quality, deduplication, and split rules.
+
+A black-box API corpus can support sequence-level distillation because teacher-generated sequences themselves can be training targets. It cannot reproduce classic logit-level knowledge distillation unless the provider exposes the teacher probability distribution or logits. Preserve exact text and structured messages as canonical data; tokenizer IDs are model-specific derived data and should not be the sole representation.
+
+* Observed facts from primary sources
+
+** OpenRouter already separates content logging from usage metadata
+
+OpenRouter documents that it stores request metadata such as token counts and latency while prompt/response content is not retained by default. Its private Input & Output Logging feature is opt-in and stores full prompt/completion content for the account's own review. This makes local interception useful even when provider-side logging exists: local storage controls retention, schema, provenance, and export policy rather than depending on a provider observability feature.
+
+Source retrieved 2026-08-17:
+- [[https://openrouter.ai/docs/guides/privacy/data-collection][OpenRouter: Data Collection]]
+- [[https://openrouter.ai/docs/guides/features/input-output-logging][OpenRouter: Input & Output Logging]]
+
+** Distillation permission is model-specific and should be captured as provenance
+
+OpenRouter explicitly distinguishes models whose outputs may be used for text distillation. Its documentation describes the =is_trainable_text= property and the =provider.enforce_distillable_text=true= routing option. It also warns that this information is best-effort and that the applicable model license/terms still need to be verified for the intended use.
+
+This suggests that a corpus collector should record, at generation time, at least:
+
+- requested model;
+- actual response model/provider when available;
+- provider endpoint;
+- whether distillable routing was enforced;
+- the observed distillation-policy state and policy timestamp/version when obtainable;
+- a later independently evaluated =training_eligible= status.
+
+The last field must not be inferred merely from successful API access.
+
+Source retrieved 2026-08-17:
+- [[https://openrouter.ai/docs/cookbook/evaluate-and-optimize/distillation][OpenRouter: Distillation]]
+- [[https://openrouter.ai/terms][OpenRouter Terms of Service]]
+
+** OpenTelemetry's GenAI conventions are a strong normalization baseline
+
+The OpenTelemetry GenAI semantic conventions define provider-independent attributes for request model, response model, response ID, finish reasons, time to first chunk, input tokens, output tokens, cache-read/cache-creation tokens, reasoning tokens when applicable, and generation parameters such as temperature, top-p, maximum tokens, and stop sequences.
+
+The conventions also define full input/output messages as opt-in attributes. That distinction is useful: operational telemetry and full-content corpus capture have different privacy, cardinality, retention, and access requirements even when they share identifiers.
+
+A local gateway should therefore align normalized names with OpenTelemetry where practical while keeping full corpus payloads in a separate content store rather than stuffing arbitrarily large prompts into ordinary metrics.
+
+Source retrieved 2026-08-17:
+- [[https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-events.md][OpenTelemetry GenAI events semantic conventions]]
+- [[https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/openai.md][OpenTelemetry OpenAI GenAI semantic conventions]]
+
+** API-output corpora naturally support sequence-level distillation
+
+Classic knowledge distillation uses information from a teacher model to train a smaller student. Hinton, Vinyals, and Dean describe transferring knowledge through the teacher's predictive distribution. That richer form generally requires access to probabilities/logits.
+
+Kim and Rush show a sequence-level form of knowledge distillation in which teacher-generated sequences become training targets. For a black-box LLM API, this distinction is decisive: exact generated sequences are available even when teacher logits are not.
+
+Therefore:
+
+- exact request + teacher response pairs are useful for sequence-level distillation/SFT;
+- multiple teacher samples for the same task can preserve diversity and support later ranking/filtering;
+- token probabilities/logits should be stored when a provider actually exposes them, but the corpus design must not assume they exist;
+- text reconstructed later from token counts is insufficient; preserve the original content.
+
+Primary sources:
+- Geoffrey Hinton, Oriol Vinyals, Jeff Dean, /Distilling the Knowledge in a Neural Network/, 2015: [[https://arxiv.org/abs/1503.02531][arXiv:1503.02531]]
+- Yoon Kim, Alexander M. Rush, /Sequence-Level Knowledge Distillation/, EMNLP 2016: [[https://aclanthology.org/D16-1139/][ACL Anthology D16-1139]]
+
+** Preference signals are separately valuable
+
+Direct Preference Optimization (DPO) trains from preference comparisons rather than requiring a separately trained reward model plus an RL loop. A personal interaction corpus can accumulate useful preference evidence if it records explicit and implicit outcomes without pretending every behavioral signal is a clean label.
+
+Potential high-confidence preference evidence:
+
+- explicit user selection between alternatives;
+- explicit acceptance/rejection;
+- a user-authored correction paired with the preceding model output;
+- retry followed by explicit acceptance when task identity can be established;
+- code/test evidence demonstrating one candidate succeeded and another failed.
+
+Weak signals such as merely continuing the conversation should remain weak evidence rather than being silently converted into =preferred=true=.
+
+Primary source:
+- Rafael Rafailov et al., /Direct Preference Optimization: Your Language Model is Secretly a Reward Model/, 2023: [[https://arxiv.org/abs/2305.18290][arXiv:2305.18290]]
+
+OpenAI's current fine-tuning API documentation also distinguishes supervised and preference-oriented fine-tuning data and requires JSONL training files, illustrating why the archive should compile into target-specific formats instead of making a vendor JSONL format canonical.
+
+Source retrieved 2026-08-17:
+- [[https://platform.openai.com/docs/api-reference/fine-tuning/list][OpenAI Fine-tuning API reference]]
+
+* Proposed capture contract
+
+** Canonical identity
+
+Every model boundary crossing gets a stable local generation ID independent of provider request IDs.
+
+Recommended identity fields:
+
+#+begin_src text
+trace_id
+conversation_id
+generation_id
+parent_generation_id
+agent_id
+project_id
+client_id
+provider_request_id
+provider_response_id
+#+end_src
+
+The local IDs provide continuity across retries, provider fallback, replay, and migrations. Provider IDs remain provenance.
+
+** Exact raw request
+
+Preserve the actual serialized semantic request before provider-specific transport mutation where possible, plus the wire/provider representation when practical:
+
+- system/developer/user/assistant/tool messages in order;
+- multimodal parts and file references with content-addressed object IDs;
+- complete tool definitions presented to the model;
+- tool-choice configuration;
+- model and provider routing controls;
+- temperature, top-p, max tokens, seed, stop sequences, penalties, reasoning controls, response schema, and other provider parameters;
+- headers needed for provenance but never secret-bearing authorization values in ordinary normalized records;
+- request timestamp and client/source identity.
+
+If exact wire payload retention is required, place it only in the encrypted raw tier and mark secret-bearing records as ineligible for training export until sanitized.
+
+** Exact response and stream
+
+Preserve:
+
+- every returned content part;
+- assistant text;
+- structured output;
+- tool calls and arguments;
+- finish reason;
+- actual response model/provider;
+- provider response ID;
+- exposed reasoning/thinking fields only when the provider actually returns them;
+- reported input/output/cache/reasoning token counts;
+- reported or computed cost with the accounting source identified;
+- time to first chunk and total latency;
+- errors and cancellation state.
+
+For streaming, retain both the reconstructed final response and an optional ordered event log. The event log makes it possible to debug partial generations and time-to-first-token behavior without requiring downstream consumers to rebuild normal responses every time.
+
+** Tool trajectories
+
+Tool activity should be first-class corpus data rather than prose pasted into a single transcript string:
+
+#+begin_src text
+model_request
+  -> model_tool_call
+  -> tool_request
+  -> tool_result
+  -> model_request
+  -> model_output
+#+end_src
+
+Record tool name, schema/version, arguments, result, error class, duration, and causal generation IDs. This supports later tool-use SFT/evals and separates the model's action from the environment's observation.
+
+** User and verifier outcomes
+
+Keep outcome events orthogonal to generation content:
+
+#+begin_src text
+accepted(generation_id)
+rejected(generation_id)
+corrected(generation_id, replacement_id)
+retry_of(new_generation_id, old_generation_id)
+test_result(generation_id, suite, pass)
+verifier_result(generation_id, verifier, verdict)
+#+end_src
+
+Do not mutate an old record to say it was "bad" after the fact. Append the outcome event and preserve chronology.
+
+* Raw, normalized, and compiled layers
+
+** Layer 1: encrypted append-only raw ledger
+
+Purpose: exact evidence, replay, future re-normalization.
+
+Properties:
+
+- append-only event records;
+- content-addressed large blobs;
+- encryption at rest;
+- strict local permissions;
+- retention independent of any single provider;
+- schema version and capture-software version on every event;
+- no assumption that raw content is training-eligible.
+
+A practical representation is compressed JSONL segmented by time, with large binary/multimodal objects stored separately by digest.
+
+** Layer 2: normalized generation store
+
+Purpose: queries, dashboards, joins, corpus inspection.
+
+A provider-neutral record should expose OpenTelemetry-compatible request/response/usage attributes where possible and add corpus-specific provenance:
+
+#+begin_src json
+{
+  "generation_id": "uuid",
+  "trace_id": "uuid",
+  "provider": "openrouter",
+  "requested_model": "...",
+  "response_model": "...",
+  "messages": [],
+  "tools": [],
+  "output": {},
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "reasoning_output_tokens": 0
+  },
+  "latency": {
+    "time_to_first_chunk_ms": 0,
+    "total_ms": 0
+  },
+  "provenance": {
+    "distillable_enforced": false,
+    "training_eligible": "unknown",
+    "policy_checked_at": null
+  }
+}
+#+end_src
+
+The example is illustrative, not a claim that every provider exposes every field.
+
+** Layer 3: compiled datasets
+
+Purpose: training/evaluation artifacts.
+
+Never train directly from the raw ledger. Compile explicit snapshots such as:
+
+- =sft/chat-v1.jsonl=;
+- =preference/dpo-v1.jsonl=;
+- =tool-use/trajectory-v1.jsonl=;
+- =evals/regression-v1.jsonl=.
+
+Each exported example should retain a back-reference to immutable source generation IDs plus the compiler version and filtering policy that produced it.
+
+* Why raw text/structure should be canonical instead of tokenizer IDs
+
+Tokenizer IDs are tied to a tokenizer vocabulary and revision. Future student models may use a different tokenizer, chat template, role encoding, or multimodal representation.
+
+Therefore the stable source of truth should be:
+
+1. exact UTF-8 text and structured content parts;
+2. exact roles, tool calls, tool results, and message ordering;
+3. provider/model/tokenizer identity when known;
+4. token IDs only as optional derived/cache data when an exact tokenizer is known.
+
+This keeps the corpus retokenizable for future models rather than fossilizing the archive around today's provider tokenizer.
+
+* Prolog policy layer
+
+A symbolic policy layer is well suited to deciding whether a captured generation can flow into a derived corpus because eligibility is a conjunction of explainable facts rather than a fuzzy content label.
+
+Illustrative predicates:
+
+#+begin_src prolog
+training_candidate(Id) :-
+    generation(Id),
+    policy_allows_distillation(Id),
+    secrets_status(Id, clean),
+    quality_status(Id, accepted),
+    provenance_complete(Id).
+
+preference_pair(Preferred, Rejected) :-
+    same_task(Preferred, Rejected),
+    explicit_preference(Preferred, Rejected),
+    training_candidate(Preferred),
+    corpus_eligible(Rejected).
+
+tool_trajectory_candidate(Id) :-
+    training_candidate(Id),
+    tool_trajectory(Id, Trajectory),
+    trajectory_verified(Trajectory).
+#+end_src
+
+These are proposals, not claims about an existing implementation.
+
+The useful property is auditability: an exported example can carry a proof/explanation of which rules admitted it, while policy changes can recompile the dataset without modifying the raw history.
+
+* Recommended capture-time invariants
+
+1. Never lose the exact semantic input actually presented to the model.
+2. Never overwrite an earlier generation with a retry or correction.
+3. Keep tool actions/results structurally separate and causally linked.
+4. Preserve provider-reported usage rather than estimating it when authoritative usage exists.
+5. Keep requested model and actual response model distinct.
+6. Record distillation eligibility/provenance separately from content quality.
+7. Treat unknown distillation permission as ineligible for exported training data until resolved.
+8. Keep secrets/credentials out of normalized analytics and training exports; if exact raw capture is required, isolate and encrypt the raw tier.
+9. Preserve original text/structure; retokenize when compiling for a specific student.
+10. Version every schema, redaction rule, quality rule, and dataset compiler.
+
+* Distillation products this corpus can support
+
+** Supervised fine-tuning / sequence-level distillation
+
+Input/task/context -> accepted teacher response.
+
+This is the most direct use of black-box API I/O.
+
+** Preference optimization
+
+Same task/context -> preferred response + rejected response, but only when the preference relation is supported by explicit user/verifier evidence.
+
+** Tool-use and agent-trajectory training
+
+Conversation state -> tool call -> observation -> next action/final response, preserving tool schemas and environment results.
+
+** Evaluation corpora
+
+Freeze representative tasks, expected invariants, verifier rules, and historical failure cases. Do not leak the evaluation split into later training exports.
+
+** What the corpus cannot recover after the fact
+
+If the teacher API never returned logits/probability distributions, hidden states, or other internal activations, later storage cannot recreate them. This corpus is therefore designed primarily for sequence-level/behavioral distillation, not full internal-state distillation.
+
+* Storage and query recommendation
+
+A practical local-first design is:
+
+#+begin_src text
+interceptor
+   |
+   +--> encrypted JSONL/Zstd raw segments
+   |
+   +--> normalized append-only events
+              |
+              +--> Parquet partitions
+                        |
+                        +--> DuckDB analytics
+                        +--> dataset compiler
+                        +--> dashboard / token monitor
+#+end_src
+
+This is a synthesis/proposal rather than a benchmark result. The key architectural requirement is separation of immutable capture from mutable analytical indexes and derived training products.
+
+* Open questions for implementation research
+
+- How should a gateway snapshot OpenRouter's =is_trainable_text= state so later policy changes do not erase the historical basis for a decision?
+- Should every request enforce =enforce_distillable_text=true=, or should the system preserve non-distillable traffic for ordinary use while excluding it from training exports?
+- What user actions are strong enough to create preference labels automatically?
+- How should duplicated context from long conversations be deduplicated without destroying causal history?
+- Which secrets/PII classes should be encrypted-only versus permanently excluded from raw capture?
+- How should multimodal blobs be content-addressed and licensed/provenanced?
+- Which normalized event schema should be shared with local agent runtimes so tool trajectories can be reconstructed across process boundaries?
+- How should train/dev/eval splits be formed to prevent near-duplicate conversations or descendants of the same task from crossing split boundaries?
+
+* Research conclusion
+
+If future distillation is a real goal, the interception gateway should be designed as a corpus recorder from the beginning, not retrofitted from token accounting logs later.
+
+The minimum durable unit is not =prompt_tokens + completion_tokens=. It is a provenance-rich generation graph: exact model-visible input, exact model output, tool/environment events, outcome evidence, provider/model identity, usage, timing, and training-policy state.
+
+The highest-value design choice is keeping immutable raw history separate from compiled training datasets. That allows future changes in tokenizer, student architecture, redaction rules, licensing checks, preference inference, and dataset format without discarding the original interaction evidence.
