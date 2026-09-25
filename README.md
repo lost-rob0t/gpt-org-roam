@@ -30,6 +30,33 @@ The initial general agent-systems backbone covers:
 - mutation testing as adversarial evidence;
 - spec-carrying agent loops.
 
+## Personal LLM memory and Gemini Notebook
+
+This repository also has a local-first LLM journal/export path. Raw provider history is **not** committed by default: ChatGPT conversations import into the gitignored `private/` tree, where they can still participate in the local Org-roam graph.
+
+```bash
+python3 tools/llm_roam.py import-chatgpt ~/Downloads/conversations.json
+```
+
+Build a Gemini Notebook source set with:
+
+```bash
+python3 tools/llm_roam.py build-gemini
+python3 tools/llm_roam.py verify-gemini
+```
+
+`build-gemini` automatically includes sibling `starintel-auto-research` and `starintel-server` checkouts when present. You can pin exact local checkouts instead:
+
+```bash
+python3 tools/llm_roam.py build-gemini \
+  --repo auto-research=../starintel-auto-research \
+  --repo starintel-server=../starintel-server
+```
+
+The generated `_exports/gemini/` directory contains uploadable Markdown source packs, `CODE-INDEX.csv`, notebook instructions, and a hash manifest. StarIntel material is a read-only projection: Auto-Research remains the research/design authority, and StarIntel Server plus its schema lock remain runtime/schema authority.
+
+See the Org-roam architecture node **LLM Org-roam with Gemini Notebook Code Execution** for the full model.
+
 ## Contribution and merge policy
 
 Changes should be made on a feature branch and submitted through a pull request.

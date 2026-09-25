@@ -1,0 +1,31 @@
+:PROPERTIES:
+:ID:       eeb529c9-a63f-4e9c-8301-3c138385757f
+:END:
+#+title: Gemini Notebook Personal LLM Knowledge Workspace
+#+filetags: :project:gemini:llm:org-roam:
+
+* Purpose
+
+Use Gemini Notebook as a grounded, code-capable working surface over the user's personal Org-roam knowledge and selected project repositories.
+
+* Architecture
+
+- [[id:5f52f0da-a9db-42e5-b896-079b18fd4570][LLM Org-roam with Gemini Notebook Code Execution]]
+
+* Canonical inputs
+
+- local Org-roam graph;
+- local/private ChatGPT conversation archive;
+- =starintel-auto-research= as read-only research/design source;
+- =starintel-server= as read-only runtime/schema source.
+
+* Generated notebook inputs
+
+- =NOTEBOOK-INSTRUCTIONS.md=
+- =CODE-INDEX.csv=
+- numbered Markdown source packs;
+- =MANIFEST.json= for local verification.
+
+* Operating rule
+
+Notebook output is analysis/work product. It is not StarIntel approval, implementation status, or runtime truth until the corresponding authoritative repository records and verifies that state.

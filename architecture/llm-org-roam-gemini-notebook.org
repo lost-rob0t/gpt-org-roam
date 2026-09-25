@@ -1,0 +1,122 @@
+:PROPERTIES:
+:ID:       5f52f0da-a9db-42e5-b896-079b18fd4570
+:END:
+#+title: LLM Org-roam with Gemini Notebook Code Execution
+#+filetags: :architecture:llm:org-roam:gemini:notebook:
+
+* Goal
+
+Maintain a real personal LLM knowledge graph from conversations and project work while preserving the authority boundaries of the source repositories.
+
+The system has two layers:
+
+1. canonical/local Org-roam knowledge, including private append-only LLM conversation history;
+2. generated Gemini Notebook source packs used for grounded reasoning and code execution.
+
+Gemini Notebook is a consumer of the graph, not the canonical store.
+
+* Authority boundaries
+
+- General personal knowledge and chat history live in this repository's Org-roam tree.
+- Raw conversation history is evidence. A statement in a chat is not automatically a verified fact or project decision.
+- =starintel-auto-research= retains StarIntel research/design approval authority.
+- =starintel-server= retains runtime authority and its live schema lock.
+- Generated Notebook Markdown, CSV indexes, and manifests are read-only projections.
+- No generated projection may write approval state back into Auto-Research or mutate StarIntel Server.
+
+This prevents a notebook summary from becoming a second StarIntel control plane.
+
+* Privacy model
+
+Raw ChatGPT exports default to =private/llm/chatgpt/=.
+
+=private/= and generated =_exports/= are gitignored. This repository is public, so conversation history must not be committed merely because it is useful to the local graph.
+
+The Gemini export may include the local private tree when it is built on the user's machine. That is intentional: Gemini receives the user's selected notebook sources without making those sources public in Git.
+
+Credential-like files are excluded by the source packer. Environment files, common credential/secret/token filenames, private keys, keystores, and binary files are not projected.
+
+* Conversation ingestion
+
+The first importer consumes ChatGPT's =conversations.json= export.
+
+Each conversation receives a deterministic UUIDv5 Org-roam ID derived from the provider conversation id. Every visible message is retained in timestamp order with provider message identity and role metadata.
+
+The raw archive is append-only in meaning: repeated imports may refresh the provider snapshot, but durable knowledge should be promoted into normal concept, research, architecture, tutorial, or project nodes rather than editing history into a preferred narrative.
+
+Future provider adapters should normalize into the same conversation model rather than create provider-specific knowledge schemas.
+
+* Gemini Notebook projection
+
+The builder scans:
+
+- the local GPT Org-roam checkout, including gitignored private Org files;
+- a sibling =starintel-auto-research= checkout when present;
+- a sibling =starintel-server= checkout when present;
+- additional explicitly supplied repositories.
+
+Text/code files are rendered into Markdown source packs. Every embedded file records:
+
+- collection;
+- repository-relative path;
+- SHA-256;
+- language;
+- original text.
+
+A generated =CODE-INDEX.csv= gives the code notebook a compact index of source ids, paths, languages, sizes, hashes, and the pack containing each file.
+
+A generated =MANIFEST.json= hashes every pack and records the StarIntel schema lock metadata when StarIntel Server is included.
+
+The default pack size is intentionally below Gemini Notebook's documented per-source ceiling so the output remains uploadable without relying on an undocumented ZIP importer.
+
+* StarIntel port model
+
+"Porting" StarIntel into the notebook means a faithful read-only code/research projection, not rewriting the server in a second runtime.
+
+For Auto-Research, include source-like repository files and preserve the existing Org metadata that distinguishes lifecycle status from human research approval.
+
+For StarIntel Server, include the server source and =schema/starintel-schema.lock.json=. The pack builder fails if StarIntel Server is requested without a usable lock. Notebook instructions state that the live lock beats stale prose.
+
+This makes the notebook useful for:
+
+- code search and cross-repository reasoning;
+- schema-aware examples;
+- research-to-code traceability;
+- small reproductions and data transforms in the notebook computer;
+- drafting patches/tests that are later applied and verified in the real repositories.
+
+It does not claim that Gemini's cloud computer can boot the production Common Lisp actor system or its external services.
+
+* Verification
+
+Generated outputs are deterministic enough to audit:
+
+- file content is hashed before packing;
+- pack files are hashed in the manifest;
+- =verify-gemini= checks the materialized pack against those hashes;
+- CI tests deterministic ChatGPT ids, private-history inclusion, secret exclusion, StarIntel lock capture, and tamper detection.
+
+* CLI
+
+#+begin_src bash
+# Import an official ChatGPT export into the local, gitignored graph.
+python3 tools/llm_roam.py import-chatgpt ~/Downloads/conversations.json
+
+# Auto-discovers sibling starintel-auto-research and starintel-server checkouts.
+python3 tools/llm_roam.py build-gemini
+
+# Or choose exact repositories.
+python3 tools/llm_roam.py build-gemini \
+  --repo auto-research=../starintel-auto-research \
+  --repo starintel-server=../starintel-server
+
+python3 tools/llm_roam.py verify-gemini
+#+end_src
+
+Upload the generated Markdown packs, =CODE-INDEX.csv=, and =NOTEBOOK-INSTRUCTIONS.md= as Notebook sources. Keep =MANIFEST.json= beside them as the local audit record.
+
+* Evolution
+
+The next provider adapter should be incremental rather than another full export pipeline: normalize a provider turn/session into the same deterministic Org representation and write it to the private journal.
+
+Durable memory extraction should remain explicit and provenance-preserving. The graph should be able to answer "where did this claim/decision come from?" before it tries to be clever.
