@@ -55,6 +55,16 @@ For autonomous-agent material, distinguish a plan from a specification:
 - Legitimate requirement changes create a new version with explicit provenance/supersession.
 - Verification evidence should be produced independently of the worker's self-report when practical.
 
+## LLM journal and notebook projections
+
+- Raw provider conversation history belongs under the gitignored `private/` tree by default. Do not commit private transcripts merely to make them searchable.
+- Raw conversation nodes are evidence/history, not automatically verified facts or durable project decisions.
+- Promote durable knowledge into the normal concept/research/architecture/tutorial/project graph with provenance back to its source when useful.
+- Generated Gemini Notebook material belongs under `_exports/` and is never canonical.
+- Importing `starintel-auto-research` or `starintel-server` into a notebook is read-only projection. Preserve upstream approval/lifecycle metadata and schema-lock authority.
+- Never copy credential-like files into a notebook source pack. Keep secrets in environment variables, wallet/keyring, or auth-source; generated files must not create another secret store.
+- A notebook execution result is evidence about that notebook environment only. Do not report production StarIntel behavior, CI status, or deployment status from notebook execution alone.
+
 ## Change workflow
 
 - Work on a feature branch.

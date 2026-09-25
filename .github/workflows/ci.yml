@@ -85,3 +85,12 @@ jobs:
               f'{len(ids)} unique Org-roam IDs, and indexed tutorials'
           )
           PY
+
+  llm-roam-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Test LLM import and Gemini source packs
+        run: python3 -m unittest discover -s tests -p 'test_llm_roam.py'

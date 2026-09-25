@@ -23,6 +23,7 @@
 * Architecture
 - [[id:a3161109-44f1-4955-be1b-7fbdc203cac1][Spec-Carrying Agent Loop]]
 - [[id:dca7bf46-7062-4e34-bfaf-8bec6e520a42][StarLang Compiler and Runtime Architecture]]
+- [[id:5f52f0da-a9db-42e5-b896-079b18fd4570][LLM Org-roam with Gemini Notebook Code Execution]]
 
 * Tutorials
 - [[id:efbd8078-67b9-4f9e-adcf-99d94338d289][Prolog-RLM Deep Dive: Building Bounded Recursive LLM Harnesses in SWI-Prolog]]
@@ -31,6 +32,7 @@
 
 * Projects
 - [[id:1111004a-95fd-488b-979b-e8433431e299][StarLang]]
+- [[id:eeb529c9-a63f-4e9c-8301-3c138385757f][Gemini Notebook Personal LLM Knowledge Workspace]]
 
 * Repository model
 
